@@ -1,0 +1,45 @@
+Notes on replicating zfs snapshots to Amazon S3/Glacier
+
+AWS connection (via boto):
+    * S3 Key ID (required)
+    * S3 Secret (required)
+    * endpoint (boto3 only)
+
+AWS Bucket (via boto)
+    * name
+    * location (defaults to east coast USA)
+    * Data upload must be to STANDARD or STANDARD_IA
+    * Data can be migrated based on prefix and after a time period
+    * Glacier data takes min. 4 hours to restore
+    
+Data is stored in a bucket in key/value format.
+    * Key may have '/', in which case treated like folders, essentially filename
+    * Value (data) can be up to 5TB in S3, 40TB in Glacier
+
+Proposed layout:
+
+	 * Create bucket if needed (exception on error)
+	 * Add lifecycle rule:
+	   * prefix=glacier/ days=0 transition=GLACIER
+	 * ${BUCKET}
+		/${HOSTNAME}
+			/${POOLNAME}/map.json
+			/lockfile
+		/glacier
+			/${HOSTNAME}/${POOLNAME}/<keyname>	-- maximum 5tb
+
+		<keyname> must be unique for glacier/${HOSTNAME}/${POOLNAME}
+		
+map.json:
+        * Array of datasets
+	  * Array of snapshots
+	    * Recursive (boolean)
+	    * Name of snapshot
+	    * Compression type
+	    * Encryption type
+	    * Date (in seconds since epoch)
+	    * Array of key components
+	      * glacier/<keyname>
+	      * SHA1 checksum of component
+	      
+	  
