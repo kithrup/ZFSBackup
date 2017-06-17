@@ -1,11 +1,12 @@
 from __future__ import print_function
 import os, sys
 import subprocess
+import time
 
 class ZFSReplicationError(ValueError):
     pass
 
-class ZFS(object):
+class ZFSReplication(object):
     """
     Base class for doing ZFS replication.
     """
@@ -17,7 +18,7 @@ class ZFS(object):
         self.validate()
 
     def __repr__(self):
-        return "ZFS({})".format(self.target)
+        return "{}({})".format(self.__class__.__name__, self.target)
     
     def validate(self):
         """
@@ -80,13 +81,13 @@ class ZFS(object):
             snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
         return snapshots
 
-class ZFSCount(ZFS):
+class ZFSReplicationCount(ZFSReplication):
     def __init__(self, target):
-        super(ZFSCount, self).__init__(target)
+        super(ZFSReplicationCount, self).__init__(target)
         self._count = 0
         
     def __repr__(self):
-        return "ZFSCount({})".format(self.target)
+        return "{}({})".format(self.__class__.__name__, self.target)
 
     def validate(self):
         return
@@ -115,10 +116,10 @@ class ZFSCount(ZFS):
     
 if __name__ == "__main__":
     for ds in sys.argv[1:]:
-        target = ZFS(ds)
+        target = ZFSReplication(ds)
 #        print("Target = {}".format(target))
 #        print(target.snapshots)
-        target = ZFSCount(ds)
+        target = ZFSReplicationCount(ds)
         print("Target = {}".format(target))
         # Should not hardcode this, even for testing.
         snapname = "zroot/usr/home@auto-snap-mgmt-2017-06-16_20.50"
