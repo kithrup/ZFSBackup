@@ -5,112 +5,130 @@ import subprocess
 class ZFSReplicationError(ValueError):
     pass
 
-class ZFSReplication(object):
-    def __init__(self, src_ds, dst_ds,
-                 recursive=False):
-        self._source = src_ds
-        self._destination = dst_ds
-        self._recursive = recursive
-        print(self, file=sys.stderr)
-        
+class ZFS(object):
+    """
+    Base class for doing ZFS replication.
+    """
+    def __init__(self, target):
+        # The only thing we need to do here is ensure the target
+        # exists.  We'll call a method to validate it, so subclassing
+        # works
+        self._dest = target
+        self.validate()
+
     def __repr__(self):
-        return "ZFSReplication('{}', '{}', recursive={})".format(
-            self.source, self.destination, self.recursive)
+        return "ZFS({})".format(self.target)
     
-    def Snapshots(self):
-        # Return an array of snapshots for the destination.
-        # sorted by creation time.
-        # Return value is an array of dictionaries.
-        # This would be easier with libzfs.
-        command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation",
-                                     "-s", "creation", "-r"]
-        if not self.recursive:
-            command.extend(["-d", "1"])
-        command.append(self.destination)
+    def validate(self):
+        """
+        Ensure the destination exists.  Derived classes will want
+        to override this.
+        This would be better with libzfs.
+        """
+        command = ["/sbin/zfs", "list", "-H", self.target]
         try:
-            output = subprocess.check_output(command)
-            print("output = {}".format(output), file=sys.stderr)
+            with open("/dev/null", "w") as devnull:
+                subprocess.check_call(command, stdout=devnull, stderr=devnull)
         except subprocess.CalledProcessError:
-            raise ZFSReplicationError("Cannot get snapshots on destination {}".format(self.source))
+            raise ZFSReplicationError("Target {} does not exist".format(self.target))
+        return
+
+    def replicate(self, source, name, date=None, recursive=False):
+        """
+        Replicate from source.  source must be an object that supports
+        read().  If date is not given, we will use the current time, so
+        it should really be set.
+        The name, date, and recursive parameters are for informational
+        purposes in the base class, but may be used for other purposes
+        in derived classes
+        """
+        command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
+        try:
+            subprocess.check_call(command, stdin=source)
+        except subprocess.CalledProcessError:
+            raise ZFSReplicationerror("Could not replicate {} to target {}".format(name, self.target))
+        return
+    
+    @property
+    def target(self):
+        return self._dest
+
+    @property
+    def snapshots(self):
+        """
+        Return an array of snapshots for the destination.
+        Each entry in the array is a dictonary with at least
+        two keys -- Name and CreationTime.  CreationTime is
+        an integer (unix seconds).  The array is sorted by
+        creation time (oldest first).  If there are no snapshots,
+        an empty array is returned.
+        This would be better with libzfs.
+        """
+        command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation",
+                   "-r", "-d", "1", "-t", "snapshot", "-s", "creation",
+                   self.target]
+        try:
+            output = subprocess.check_output(command).split("\n")
+        except subprocess.CalledProcessError:
+            # We'll assume this is because there are no snapshots
+            return []
         snapshots = []
-        print("output = {}".format(output), file=sys.stderr)
         for snapshot in output:
             if not snapshot:
                 continue
-            t = snapshot.rstrip().split()
-            print("t = {}".format(t), file=sys.stderr)
-            snapshots.append({ "Name" : t[0], "CreationTime" : t[1] })
+            (name, ctime) = snapshot.rstrip().split()
+            snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
         return snapshots
 
-    def validate(self):
-        # Make sure the parameters are okay.
-        # For this base class, this means making
-        # sure that source and dest don't overlap
-        # (if recursive), or aren't the same (if not
-        # recursive).
-        if not self.source:
-            raise ZFSReplicationError("Source dataset must be set")
-        if not self.destination:
-            raise ZFSReplicationError("Destination dataset must be set")
-        if self.recursive:
-            src_path_comps = self.source.split("/")
-            dst_path_comps = self.destination.split("/")
-            if src_path_comps == dst_path_comps[:len(src_path_comps)]:
-                raise ZFSReplicationError("Recursive replication cannot overlap")
-        else:
-            if self.source == self.destination:
-                raise ZFSReplicationError("Source and destination datasets cannot be the same")
-        # Ensure destination does not overlap itself
-        # What that means is, tank/foo -> tank would be an error.
-        # Essentially, see if dirname(src) == dst
-        if os.path.dirname(self.source) == self.destination:
-            raise ZFSReplicationError("Replication would over-write itself")
-        # The destination cannot be the root dataset
-        if len(self.destination.split("/")) == 1:
-            raise ZFSReplicationError("Replication cannot be to pool")
+class ZFSCount(ZFS):
+    def __init__(self, target):
+        super(ZFSCount, self).__init__(target)
+        self._count = 0
+        
+    def __repr__(self):
+        return "ZFSCount({})".format(self.target)
 
+    def validate(self):
         return
 
+    def replicate(self, source, name, date=None, recursive=False):
+        """
+        Just count the characters
+        """
+        count = 0
+        mByte = 1024 * 1024
+        while True:
+            buf = source.read(mByte)
+            if buf:
+                count += len(buf)
+            else:
+                break
+            
+        self._count = count
+        
     @property
-    def source(self):
-        return self._source
+    def snapshots(self):
+        return []
     @property
-    def destination(self):
-        return self._destination
-    @property
-    def recursive(self):
-        return self._recursive
+    def count(self):
+        return self._count
     
-try:
-    repl = ZFSReplication("zroot", "zroot/backup", recursive=True)
-    repl.validate()
-except ZFSReplicationError:
-    print("Got expected error for zroot -> zroot/backup recursive")
-    pass
-else:
-    raise Exception("Expected an error but did not get one!")
-
-# This one should not get an error
-repl = ZFSReplication("zroot", "zroot/backup")
-repl.validate()
-
-# This should not get an error
-repl = ZFSReplication("zroot/TestDataset", "zroot/var/tmp")
-repl.validate()
-print("Snapshots on source = {}".format(repl.SourceSnapshots()))
-
-# This one should not get an error
-repl = ZFSReplication("zroot/backup/Media", "zroot", recursive=True)
-repl.validate()
-
-# This one should get an error
-try:
-    repl = ZFSReplication("zroot/Data/Media", "zroot/Data")
-    repl.validate()
-except ZFSReplicationError:
-    print("Got expected error zroot/Data/Media -> zroot/Data")
-else:
-    raise Exception("Expected an error but did not get one!")
-
-# Should work
-repl = ZFSReplication("zroot", "tank/Backup", recursive=True)
+if __name__ == "__main__":
+    for ds in sys.argv[1:]:
+        target = ZFS(ds)
+#        print("Target = {}".format(target))
+#        print(target.snapshots)
+        target = ZFSCount(ds)
+        print("Target = {}".format(target))
+        # Should not hardcode this, even for testing.
+        snapname = "zroot/usr/home@auto-snap-mgmt-2017-06-16_20.50"
+        command = ["/sbin/zfs", "send", snapname]
+        with open("/dev/null", "rw") as devnull:
+            mByte = 1024 * 1024
+            snap_io = subprocess.Popen(command,
+                                       bufsize=mByte,
+                                       stdin=devnull,
+                                       stdout=subprocess.PIPE,
+                                       stderr=devnull)
+            target.replicate(snap_io.stdout, snapname)
+            print("{} bytes in snapshot".format(target.count))
