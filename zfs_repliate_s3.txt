@@ -43,3 +43,9 @@ map.json:
 	      * SHA1 checksum of component
 	      
 	  
+Notes on ZFS replication
+
+* Basic replication is zfs send | zfs recv
+* Replication can be recursive
+  * If recursive, ensure that destination is not a child of source
+  
