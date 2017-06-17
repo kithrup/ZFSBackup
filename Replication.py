@@ -19,7 +19,36 @@ class ZFSReplication(object):
         self._ds = dataset
         self._recursive = recursive
         self.validate()
+        self._filters = None
+        
+    def AddFilter(self, cmd, *args):
+        # Add a filter.  This is invoked during replicate,
+        # and is set up as a pipeline in the order created.
+        # That is: AddFilter("/bin/cat"); AddFilter("/usr/bin/sort")
+        # would do the equivalent of "<input source> | cat | sort | <target>".
+        x = [cmd]
+        if args: x.extend(args)
+        if self._filters is None:
+            self._filters = []
+        print("Adding filter `{}`".format(" ".join(x)), file=sys.stderr)
+        self._filters.append(x)
 
+    def filter(self, source, error=None):
+        # Sets up the filters (if any), and returns the stdout of
+        # the last one.  If there are none, it returns source.
+        if self._filters is None:
+            return source
+        input = source
+        mByte = 1024 * 1024
+        for f in self._filters:
+            print("Adding filter `{}`".format(" ".join(f)), file=sys.stderr)
+            p = subprocess.Popen(f, bufsize=mByte,
+                                 stdin=input,
+                                 stderr=error,
+                                 stdout=subprocess.PIPE)
+            input = p.stdout
+        return input
+    
     def __repr__(self):
         return "{}({})".format(self.__class__.__name__, self.target)
     
@@ -64,8 +93,9 @@ class ZFSReplication(object):
         destination = os.path.join(self.target, self.dataset)
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
         with tempfile.TemporaryFile() as error_output:
+            fobj = self.filter(source, error=error_output)
             try:
-                subprocess.check_call(command, stdin=source, stderr=error_output)
+                subprocess.check_call(command, stdin=fobj, stderr=error_output)
             except subprocess.CalledProcessError:
                 name = "{}@{}".format(self.dataset, snapname)
                 error_output.seek(0)
@@ -130,8 +160,10 @@ class ZFSReplicationCount(ZFSReplication):
         """
         count = 0
         mByte = 1024 * 1024
+        print("self.filter = {}".format(self.filter), file=sys.stderr)
+        fobj = self.filter(source)
         while True:
-            buf = source.read(mByte)
+            buf = fobj.read(mByte)
             if buf:
                 count += len(buf)
             else:
@@ -191,7 +223,7 @@ def main():
         print("No replication type method.  Valid types are zfs, counter", file=sys.stderr)
         sys.exit(1)
     elif args.subcommand == 'counter':
-        replicator = ZFSReplicationCount("", dataset, recursive=args.recursive)
+        replicator = ZFSReplicationCount("<none>", dataset, recursive=args.recursive)
     elif args.subcommand == 'zfs':
         replicator = ZFSReplication(args.destination, dataset, recursive=args.recursive)
     else:
@@ -222,29 +254,3 @@ def main():
         
 if __name__ == "__main__":
     main()
-    sys.exit(0)
-    # Should not hardcode this, even for testing.
-    (dataset, snapname) = "zroot/usr/home@auto-daily-2017-06-17".split('@')
-    for ds in sys.argv[1:]:
-        target = ZFSReplication(ds, dataset)
-#        print("Target = {}".format(target))
-#        print(target.snapshots)
-        target = ZFSReplicationCount(ds, dataset)
-        print("Target = {}".format(target))
-        command = ["/sbin/zfs", "send", "{}@{}".format(dataset, snapname)]
-
-        with tempfile.TemporaryFile() as error_output:
-            with open("/dev/null", "rw") as devnull:
-                mByte = 1024 * 1024
-                snap_io = subprocess.Popen(command,
-                                           bufsize=mByte,
-                                           stdin=devnull,
-                                           stderr=error_output,
-                                           stdout=subprocess.PIPE)
-                target.replicate(snap_io.stdout, snapname)
-            
-            if snap_io.returncode:
-                error_output.seek(0)
-                print("`{}` failed {}: {}".format(command, snap_io.returncode, error_output.read()), file=sys.stderr)
-            else:
-                print("{} bytes in snapshot".format(target.count))
