@@ -30,10 +30,9 @@ class ZFSReplication(object):
         if args: x.extend(args)
         if self._filters is None:
             self._filters = []
-        print("Adding filter `{}`".format(" ".join(x)), file=sys.stderr)
         self._filters.append(x)
 
-    def filter(self, source, error=None):
+    def _filter(self, source, error=None):
         # Sets up the filters (if any), and returns the stdout of
         # the last one.  If there are none, it returns source.
         if self._filters is None:
@@ -41,7 +40,6 @@ class ZFSReplication(object):
         input = source
         mByte = 1024 * 1024
         for f in self._filters:
-            print("Adding filter `{}`".format(" ".join(f)), file=sys.stderr)
             p = subprocess.Popen(f, bufsize=mByte,
                                  stdin=input,
                                  stderr=error,
@@ -93,7 +91,7 @@ class ZFSReplication(object):
         destination = os.path.join(self.target, self.dataset)
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
         with tempfile.TemporaryFile() as error_output:
-            fobj = self.filter(source, error=error_output)
+            fobj = self._filter(source, error=error_output)
             try:
                 subprocess.check_call(command, stdin=fobj, stderr=error_output)
             except subprocess.CalledProcessError:
@@ -160,8 +158,7 @@ class ZFSReplicationCount(ZFSReplication):
         """
         count = 0
         mByte = 1024 * 1024
-        print("self.filter = {}".format(self.filter), file=sys.stderr)
-        fobj = self.filter(source)
+        fobj = self._filter(source)
         while True:
             buf = fobj.read(mByte)
             if buf:
@@ -231,6 +228,7 @@ def main():
         sys.exit(1)
 
 
+    replicator.AddFilter("/usr/local/bin/pigz")
     command = ["/sbin/zfs", "send"]
     if args.recursive:
         command.append("-R")
