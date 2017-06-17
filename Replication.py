@@ -2,6 +2,7 @@ from __future__ import print_function
 import os, sys
 import subprocess
 import time
+import tempfile
 
 class ZFSReplicationError(ValueError):
     pass
@@ -34,20 +35,22 @@ class ZFSReplication(object):
             raise ZFSReplicationError("Target {} does not exist".format(self.target))
         return
 
-    def replicate(self, source, name, date=None, recursive=False):
+    def replicate(self, source, snapname, date=None, recursive=False):
         """
         Replicate from source.  source must be an object that supports
         read().  If date is not given, we will use the current time, so
-        it should really be set.
-        The name, date, and recursive parameters are for informational
-        purposes in the base class, but may be used for other purposes
-        in derived classes
+        it should really be set.  The full snapshot name from the source
+        would be dataset@snapname.
+
+        The dataset, snapname, date, and recursive parameters are for
+        informational purposes in the base class, but may be used for
+        other purposes in derived classes
         """
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
         try:
             subprocess.check_call(command, stdin=source)
         except subprocess.CalledProcessError:
-            raise ZFSReplicationerror("Could not replicate {} to target {}".format(name, self.target))
+            raise ZFSReplicationerror("Could not replicate {} to target {}".format(name, sefl.target))
         return
     
     @property
@@ -92,7 +95,7 @@ class ZFSReplicationCount(ZFSReplication):
     def validate(self):
         return
 
-    def replicate(self, source, name, date=None, recursive=False):
+    def replicate(self, source, snapname, date=None, recursive=False):
         """
         Just count the characters
         """
@@ -115,21 +118,28 @@ class ZFSReplicationCount(ZFSReplication):
         return self._count
     
 if __name__ == "__main__":
+    # Should not hardcode this, even for testing.
+    (dataset, snapname) = "zroot/usr/home@auto-daily-2017-06-17".split('@')
     for ds in sys.argv[1:]:
         target = ZFSReplication(ds)
 #        print("Target = {}".format(target))
 #        print(target.snapshots)
         target = ZFSReplicationCount(ds)
         print("Target = {}".format(target))
-        # Should not hardcode this, even for testing.
-        snapname = "zroot/usr/home@auto-snap-mgmt-2017-06-16_20.50"
-        command = ["/sbin/zfs", "send", snapname]
-        with open("/dev/null", "rw") as devnull:
-            mByte = 1024 * 1024
-            snap_io = subprocess.Popen(command,
-                                       bufsize=mByte,
-                                       stdin=devnull,
-                                       stdout=subprocess.PIPE,
-                                       stderr=devnull)
-            target.replicate(snap_io.stdout, snapname)
-            print("{} bytes in snapshot".format(target.count))
+        command = ["/sbin/zfs", "send", "{}@{}".format(dataset, snapname)]
+
+        with tempfile.TemporaryFile() as error_output:
+            with open("/dev/null", "rw") as devnull:
+                mByte = 1024 * 1024
+                snap_io = subprocess.Popen(command,
+                                           bufsize=mByte,
+                                           stdin=devnull,
+                                           stderr=error_output,
+                                           stdout=subprocess.PIPE)
+                target.replicate(snap_io.stdout, snapname)
+            
+            if snap_io.returncode:
+                error_output.seek(0)
+                print("`{}` failed {}: {}".format(command, snap_io.returncode, error_output.read()), file=sys.stderr)
+            else:
+                print("{} bytes in snapshot".format(target.count))
