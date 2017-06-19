@@ -1,0 +1,30 @@
+ZFS Backup Strategy
+
+* Source -> destination
+  * Source can be pool or specific dataset
+  * Destination must be dataset
+  * Hierarchical datasets may need to be created
+    * tank/Media/Movies -> backup/tank/Media/Movies needs equivalent of "mkdir -p backup/tank/Media/Movies"
+* Requires at least one snapshot
+  * Incrementals require at least two snapshots
+  * Need to compare snapshots on source and destination
+* Can be recursive
+  * Recursion should be handled by zfs send -r
+  * But could determine by zfs list
+    * If done manually, backups need to be done in reverse order
+      (e.g., tank/Media/Movies/Marvel, then tank/Media/Movies, etc.)
+
+HOW TO BACKUP
+
+* Normally or force full
+* Normal backup need list of snapshots on source and destination
+  * Starting from most recent snapshot, find first snapshot in common.
+  * If there is no such snapshot, must be full repliction
+  * Otherwise, 'zfs send [-r] -I ${common} ${source}@${latest} |
+    	        zfs recv -d -F ${dest}"
+* Full backup:  'zfs send [-r] ${source}@${latest} |
+       		 zfs recv -d -f ${dest}"
+* Can backup specific snapshot, same rules above apply
+
+HOW TO RESTORE
+* Need to ensure datasets are read-write after restoring

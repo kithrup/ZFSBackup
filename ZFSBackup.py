@@ -3,9 +3,236 @@ import os, sys
 import subprocess
 import time
 import tempfile
+import threading
 
-class ZFSReplicationError(ValueError):
+class ZFSBackupError(ValueError):
     pass
+
+class ZFSBackupFilter(object):
+    """
+    Base class for ZFS backup filters.
+    Filters have several properties, and
+    start_backup() and start_restore() methods.
+    The start_* methods take a source, which
+    should be a pipe.  In general, the filters
+    should use a subprocess or thread, unless they
+    are the terminus of the pipeline.  (Doing otherwise
+    risks deadlock.)
+    """
+    def __init__(self):
+        pass
+
+    @property
+    def name(self):
+        return "Null Filter"
+
+    @property
+    def backup_command(self):
+        return []
+    @property
+    def restore_command(self):
+        return []
+    
+    def start_backup(self, source):
+        """
+        Start the filter when doing a backup.
+        E.g., for a compression filter, this would
+        start the command (in a subprocess) to
+        run gzip.
+        """
+        return source
+    def start_restore(self, source):
+        """
+        Start the filter when doing a restore.
+        E.g., for a compression filter, this would
+        start the command (in a subprocess) to
+        run 'gzcat'.
+        """
+        return source
+    
+class ZFSBackupFilterThread(ZFSBackupFilter, threading.Thread):
+    """
+    Base class for a thread-based filter.  Either it should be
+    subclassed (see ZFSBackupFilterCounter below), or it should
+    be called with a callable object as the "process=" parameter.
+    The process method may need to check ZFSBackupFilterThread.mode
+    to decide if it is backing up or restoring.
+    """
+    def __init__(self, process=None, name="Thread Filter"):
+        super(ZFSBackupFilterThread, self).__init__()
+        threading.Thread.__init__(self)
+        (self.input_pipe, self.output_pipe) = os.pipe()
+        self._source = None
+        self._done = threading.Event()
+        self._done.clear()
+        self._process = process
+        if self._process is None:
+            self._name = "Null Thread Filter"
+        else:
+            self._name = name
+
+    @property
+    def backup_command(self):
+        return ["<thread>"]
+    @property
+    def restore_command(self):
+        return ["<thread>"]
+    
+    @property
+    def input_pipe(self):
+        return self._input
+    @input_pipe.setter
+    def input_pipe(self, p):
+        self._input = p
+    @property
+    def output_pipe(self):
+        return self._output
+    @output_pipe.setter
+    def output_pipe(self, p):
+        self._output = p
+    @property
+    def source(self):
+        return self._source
+    @property
+    def mode(self):
+        return self._mode
+    
+    def process(self, buf):
+        # Subclasses should do any processing here
+        if self._process:
+            return self._process(buf)
+    
+    def run(self):
+        while True:
+            b = self.source.read(1024*1024)
+            if b:
+                os.write(self.output_pipe, self.process(b))
+            else:
+                break
+        self._done.set()
+        os.close(self.output_pipe)
+        
+    def start_backup(self, source):
+        self._mode = "backup"
+        self._source = source
+        self._py_output = os.fdopen(self.input_pipe, "rb")
+        self.start()
+        return self._py_output
+
+    def start_restore(self, source):
+        self._mode = "restore"
+        self._source = source
+        rv = os.fdopen(self.input_pipe, "rb")
+        self.start()
+        return rv
+    
+class ZFSBackupFilterCommand(ZFSBackupFilter):
+    """
+    Derived class for backup filters based on commands.
+    This adds a coupe properties, and starts the appropriate commands
+    in a Popen instance.  The error parameter in the constructor is
+    used to indicate where stderr should go; by default, it goes to
+    /dev/null
+    """
+    def __init__(self, backup_command=["/bin/cat"],
+                 restore_command=["/bin/cat"], error=None):
+        super(ZFSBackupFilterCommand, self).__init__()
+        self._backup_command=backup_command.copy()
+        self._restore_command=restore_command.copy()
+        self.error = error
+        
+    @property
+    def backup_command(self):
+        return self._backup_command
+    @property
+    def restore_command(self):
+        return self._restore_command
+    @property
+    def error(self):
+        return self._error
+    @error.setter
+    def error(self, where):
+        if self.error is not None:
+            self.error.close()
+        self._error = where
+
+    def start_restore(self, source):
+        """
+        source is a file-like object, usually a pipe.
+        We run Popen, setting source as stdin, and
+        subprocess.PIPE as stdout, and return popen.stdout.
+        If error is None, we open /dev/null for writig and
+        use that.
+        """
+        if self.error is None:
+            self.error = open("/dev/null", "w+")
+        p = subprocess.Popen(self.restore_command,
+                             bufsize=1024 * 1024,
+                             stdin=source,
+                             stdout=subprocess.PIPE,
+                             stderr=self.error)
+        return p.stdout
+    
+    def start_backup(self, source):
+        """
+        source is a file-like object, usually a pipe.
+        We run Popen, and setting source up as stdin,
+        and subprocess.PIPE as output, and return
+        popen.stdout.
+        If error is None, we open /dev/null for writing
+        and use that.
+        """
+        if self.error is None:
+            self.error = open("/dev/null", "w+")
+        p = subprocess.Popen(self.backup_command,
+                             bufsize=1024 * 1024,
+                             stderr=self.error,
+                             stdin=source,
+                             stdout=subprocess.PIPE)
+        return p.stdout
+    
+class ZFSBackupFilterCounter(ZFSBackupFilterThread):
+    """
+    A sample thread filter.  All this does is count the
+    bytes that come in to be processed.
+    """
+    def __init__(self):
+        super(ZFSBackupFilterCounter, self).__init__()
+        self._count = 0
+        
+    def name(self):
+        return "ZFS Count Filter"
+
+    def process(self, b):
+        self._count += len(b)
+        return b
+
+    @property
+    def count(self):
+        self._done.wait()
+        return self._count
+
+class ZFSBackup(object):
+    """
+    Base class for ZFS backup.
+    This doesn't do anything for backup other than dump
+    zfs send to stdout; for restore, it reads from stdin
+    and does a zfs recv.
+    """
+    def __init__(self, dataset, recursive=False):
+        self._ds = dataset
+        self._recursive = recursive
+
+    def snapshots(self):
+        return []
+    
+    @property
+    def dataset(self):
+        return self._ds
+
+    @property
+    def recursive(self):
+        return self._recursive
 
 class ZFSReplication(object):
     """
@@ -62,7 +289,7 @@ class ZFSReplication(object):
             with open("/dev/null", "w") as devnull:
                 subprocess.check_call(command, stdout=devnull, stderr=devnull)
         except subprocess.CalledProcessError:
-            raise ZFSReplicationError("Target {} does not exist".format(self.target))
+            raise ZFSBackupError("Target {} does not exist".format(self.target))
         # Okay, now let's start creating the dataset paths.  We create
         # them readonly, starting below the pool name.  We don't care if it fails; the
         # replication will fail later if we can't.
@@ -78,20 +305,39 @@ class ZFSReplication(object):
                     pass
         return
 
-    def replicate(self, source, snapname, date=None):
+    def destroy(self, snapname):
+        """
+        Destroy (recursively, if set) a given snapshot.
+        """
+        full_path = os.path.join(self.target, *(self.dataset.split("/")[1:]))
+        command = ["/sbin/zfs", "destroy"]
+        if self.recursive:
+            command.append("-r")
+        command.append("{}@{}".format(full_path, snapname))
+        with open("/dev/null", "w+") as devnull:
+            try:
+                subprocess.check_call(command, stdout=devnull, stderr=devnull)
+            except subprocess.CalledProcessError:
+                raise ZFSBackupError("Unable to destroy snapshot {}@{}".format(full_path, snapname))
+        return
+    
+    def replicate(self, source, snapname, previous=None, date=int(time.time())):
         """
         Replicate from source.  source must be an object that supports
         read().  If date is not given, we will use the current time, so
         it should really be set.  The full snapshot name from the source
-        would be dataset@snapname.
+        would be dataset@snapname.  If previous is set, it indicates this
+        is an incremental snapshot.
 
-        The snapname and date parameters are for informational purposes only;
+        The snapname, previous, and  date parameters are for informational purposes only;
         the base class doesn't use them, but derived classes may.
         """
         destination = os.path.join(self.target, self.dataset)
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
         with tempfile.TemporaryFile() as error_output:
-            fobj = self._filter(source, error=error_output)
+            # ZFS->ZFS replication doesn't use filters.
+            # fobj = self._filter(source, error=error_output)
+            fobj = source
             try:
                 subprocess.check_call(command, stdin=fobj, stderr=error_output)
             except subprocess.CalledProcessError:
@@ -99,7 +345,7 @@ class ZFSReplication(object):
                 error_output.seek(0)
                 print("`{}` failed: {}".format(" ".join(command), error_output.read()),
                       file=sys.stderr)
-                raise ZFSReplicationError("Could not replicate {} to target {}".format(name, self.target))
+                raise ZFSBackupError("Could not replicate {} to target {}".format(name, self.target))
         return
     
     @property
@@ -141,6 +387,10 @@ class ZFSReplication(object):
             snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
         return snapshots
 
+class ZFSReplicationSSH(ZFSReplication):
+    def __init__(self, target, dataset, recursive=False, ssh_cmd=None):
+        pass
+    
 class ZFSReplicationCount(ZFSReplication):
     def __init__(self, target, dataset, recursive=False):
         super(ZFSReplicationCount, self).__init__(target, dataset, recursive)
@@ -152,7 +402,10 @@ class ZFSReplicationCount(ZFSReplication):
     def validate(self):
         return
 
-    def replicate(self, source, snapname, date=None):
+    def destroy(self, snapname):
+        return
+    
+    def replicate(self, source, snapname, previous=None, date=int(time.time())):
         """
         Just count the characters
         """
@@ -194,6 +447,10 @@ def main():
                         required=True,
                         help='Snapshot to replicate')
 
+    parser.add_argument("--compressed", "-C", dest='compressed',
+                        action='store_true', default=False,
+                        help='Compress snapshots')
+    
     subparsers = parser.add_subparsers(help='sub-command help', dest='subcommand')
 
     # We have a sub parser for each type of replication
@@ -228,7 +485,8 @@ def main():
         sys.exit(1)
 
 
-    replicator.AddFilter("/usr/local/bin/pigz")
+    if args.compressed:
+        replicator.AddFilter("/usr/local/bin/pigz")
     command = ["/sbin/zfs", "send"]
     if args.recursive:
         command.append("-R")
