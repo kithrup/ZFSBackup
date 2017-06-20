@@ -5,6 +5,51 @@ import time
 import tempfile
 import threading
 
+def _merge_snapshots(list1, list2):
+    """
+    Given a list of snapshots, return a list of
+    common snapshots (sorted by creation time).
+    The return list is simply an array of names.
+    N.B.: Snapshots are assumed to be the same if
+    they have the same name!
+    """
+    rv = []
+#    print("list1 names = {}".format([el["Name"] for el in list1]), file=sys.stderr)
+#    print("list2 names = {}".format([el["Name"] for el in list2]), file=sys.stderr)
+    if list2:
+        dict2 = dict((el["Name"], True) for el in list2)
+        for snapname in [x["Name"] for x in list1]:
+ #           print("Checking snapname {}".format(snapname), file=sys.stderr)
+            if snapname in dict2:
+                rv.append(snapname)
+            else:
+                pass; #print("\tNot in list2?")
+    return rv
+
+def _get_snapshots(ds):
+    """
+    Return a list of snapshots for the given dataset.
+    This only works for local ZFS pools, obviously.
+    It relies on /sbin/zfs sorting, rather than sorting itself.
+    """
+    command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation",
+               "-r", "-d", "1", "-t", "snapshot", "-s", "creation",
+               ds]
+    print("get_snapshots: {}".format(" ".join(command)), file=sys.stderr)
+    try:
+        output = subprocess.check_output(command).split("\n")
+    except subprocess.CalledProcessError:
+        # We'll assume this is because there are no snapshots
+        return []
+    snapshots = []
+    for snapshot in output:
+        if not snapshot:
+            continue
+        (name, ctime) = snapshot.rstrip().split()
+        name = name.split('@')[1]
+        snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
+    return snapshots
+
 class ZFSBackupError(ValueError):
     pass
 
@@ -22,6 +67,13 @@ class ZFSBackupFilter(object):
     def __init__(self):
         pass
 
+    @property
+    def error_output(self):
+        return None
+    @error_output.setter
+    def error_output(self, e):
+        return
+    
     @property
     def name(self):
         return "Null Filter"
@@ -148,13 +200,13 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
     def restore_command(self):
         return self._restore_command
     @property
-    def error(self):
-        return self._error
-    @error.setter
-    def error(self, where):
-        if self.error is not None:
+    def error_output(self):
+        return self._error_output
+    @error_output.setter
+    def error_output(self, where):
+        if self.error:
             self.error.close()
-        self._error = where
+        self._error_output = where
 
     def start_restore(self, source):
         """
@@ -196,9 +248,10 @@ class ZFSBackupFilterCounter(ZFSBackupFilterThread):
     A sample thread filter.  All this does is count the
     bytes that come in to be processed.
     """
-    def __init__(self):
+    def __init__(self, handler=None):
         super(ZFSBackupFilterCounter, self).__init__()
         self._count = 0
+        self.handler = handler
         
     def name(self):
         return "ZFS Count Filter"
@@ -208,79 +261,179 @@ class ZFSBackupFilterCounter(ZFSBackupFilterThread):
         return b
 
     @property
+    def handler(self):
+        return self._handler
+    @handler.setter
+    def handler(self, h):
+        self._handler = h
+
+    @property
     def count(self):
         self._done.wait()
+        if self.handler and iscallable(self.handler):
+            self.handler(self._count)
         return self._count
 
 class ZFSBackup(object):
     """
-    Base class for ZFS backup.
-    This doesn't do anything for backup other than dump
-    zfs send to stdout; for restore, it reads from stdin
-    and does a zfs recv.
+    Base class for doing ZFS backups.
+    Backups are done using snapshots -- zfs send is used -- not using files.
+    Every backup must have a source and a target, although subclasses
+    can change how they are interpreted.  Backups can be recursive.
+
+    One ZFSBackup object should be created for each <source, target>, but
+    not for each snapshot.  That is, you would use
+
+    backup = ZFSBackup("/tank/Media", "/backup/tank/Media", recursive=True)
+    <do backup>
+    backup = ZFSBackup("/tank/Documents", "/backup/tank/Documents")
+    <do backup>
+
+    instead of creating a ZFSBackup object for each snapshot.
+
+    In general, backups and restores are simply inverses of each other.
+
+    In order to perform backups, it is necesary to get a list of snapshots
+    on both the source and target.  An empty list on the target will mean
+    a full backup is being done; an empty list on the source is a failure.
+
+    Backups can have filters applied to them.  This is not used in the base
+    class (since it only implements ZFS->ZFS), but subclasses may wish to
+    add filters for compression, encryption, or accounting.  Some sample
+    filter classes are provided.
+
+    Some notes on how replication works:
+    * source is the full path to the dataset. *Or* it can be the entire pool.
+    * target is the dataset to which the replication should go.
+    * If source is the full pool, then the target will have all of the files
+    at the root of the source pool.
+    * If source is NOT the full pool, then the target will end up with only the
+    dataset(s) being replicated -- but any intervening datasets will be created.
+
+    What this means:
+    * tank -> backup/tank means we end up with backup/tank as a copy of tank.
+    * tank/usr/home > backup/home means we end up with bakup/home/usr/home.
+    * When getting snapshots for the destination, we need to add the path for
+    source, *minus* the pool name.
+    * UNLESS we are replicating the full pool.
+    What *that* means:
+    * tank -> backup/tank means getting snapshots from backup/tank
+    * tanks/usr/home -> backup/home means getting snapshots from backup/home/usr/home
+
     """
-    def __init__(self, dataset, recursive=False):
-        self._ds = dataset
-        self._recursive = recursive
+    def __init__(self, source, target, recursive=False):
+        """
+        Parameters:
+        source - (str) a ZFS pool or dataset to be backed up.
+        target - (str) a ZFS dataset to be backed up.
+        recursive - (bool) Indicate whether the backup is to be recursive or not.
 
-    def snapshots(self):
-        return []
-    
+        The only thing the base class does is run some validation tests
+        on the source and target.
+        """
+        self.target = target
+        self.source = source
+        self.recursive = recursive
+        self._source_snapshots = None
+        self._target_snapshots = None
+        self._filters = []
+        self.validate()
+
     @property
-    def dataset(self):
-        return self._ds
-
+    def target(self):
+        return self._dest
+    @target.setter
+    def target(self, t):
+        self._dest = t
+    @property
+    def source(self):
+        return self._source
+    @source.setter
+    def source(self, s):
+        self._source = s
+        
     @property
     def recursive(self):
         return self._recursive
-
-class ZFSReplication(object):
-    """
-    Base class for doing ZFS replication.
-    """
-    def __init__(self, target, dataset, recursive=False):
-        # The only thing we need to do here is ensure the target
-        # exists.  We'll call a method to validate it, so subclassing
-        # works
-        self._dest = target
-        self._ds = dataset
-        self._recursive = recursive
-        self.validate()
-        self._filters = None
+    @recursive.setter
+    def recursive(self, b):
+        self._recursive = b
         
-    def AddFilter(self, cmd, *args):
-        # Add a filter.  This is invoked during replicate,
-        # and is set up as a pipeline in the order created.
-        # That is: AddFilter("/bin/cat"); AddFilter("/usr/bin/sort")
-        # would do the equivalent of "<input source> | cat | sort | <target>".
-        x = [cmd]
-        if args: x.extend(args)
-        if self._filters is None:
-            self._filters = []
-        self._filters.append(x)
-
-    def _filter(self, source, error=None):
-        # Sets up the filters (if any), and returns the stdout of
-        # the last one.  If there are none, it returns source.
-        if self._filters is None:
-            return source
+    def AddFilter(self, filter):
+        """
+        Add a filter.  The filter is set up during the backup and
+        restore methods.  The filter needs to be an instance of
+        ZFSFilter -- at least, it needs to have the start_backup and
+        start_restore methods.
+        """
+        if not callable(getattr(filter, "start_backup", None)) and \
+           not callable(getattr(filter, "start_restore", None)):
+            raise ValueError("Incorrect type passed for filter")
+        self._filters.append(filter)
+        
+    def _filter_backup(self, source, error=None):
+        # Private method, to stitch the backup filters together.
         input = source
-        mByte = 1024 * 1024
         for f in self._filters:
-            p = subprocess.Popen(f, bufsize=mByte,
-                                 stdin=input,
-                                 stderr=error,
-                                 stdout=subprocess.PIPE)
-            input = p.stdout
+            f.error_output = error
+            input = f.start_backup(input)
+        return input
+    
+    def _filter_restore(self, source, error=None):
+        # Private method, to stitch the restore filters together.
+        input = source
+        for f in self._filters:
+            f.error_output = error
+            input = f.start_restore(input)
         return input
     
     def __repr__(self):
-        return "{}({})".format(self.__class__.__name__, self.target)
+        return "{}(source={}, target={})".format(self.__class__.__name__, self.source, self.target)
     
+    @property
+    def source_snapshots(self):
+        """
+        Return a list of snapshots on the source.  The return value is
+        an array of dictionaries; the dictionaries have, at minimum, two
+        elements:
+		Name	-- (str) Snapshot name. The part that goes after the '@'
+        	CreationTime -- (int) Time (in unix epoch seconds) the snapshot was created.
+        Even if the recursive is true, this _only_ lists the snapshots for the
+        source (recursive requires that the same snapshot exist on the descendents,
+        or it doesn't get backed up).
+        We cache this so we don't have to keep doing a list.
+        """
+        if not self._source_snapshots:
+            self._source_snapshots = _get_snapshots(self.source)
+        return self._source_snapshots
+
+    @property
+    def target_snapshots(self):
+        """
+        Return a list of snapshots on the target.  The return value is
+        an array of dictionaries; the dictionaries have, at minimum, two
+        elements:
+		Name	-- (str) Snapshot name. The part that goes after the '@'
+        	CreationTime -- (int) Time (in unix epoch seconds) the snapshot was created.
+        Even if the recursive is true, this _only_ lists the snapshots for the
+        target dataset.
+        We cache this so we dont have to keep doing a list.
+        """
+        if not self._target_snapshots:
+            # See the long discussion above about snapshots.
+            (src_pool, _, src_ds) = self.source.partition("/")
+            if src_ds:
+                target_path = "{}/{}".format(self.target, src_ds)
+            else:
+                target_path = "{}/{}".format(self.target, src_pool)
+                
+            self._target_snapshots = _get_snapshots(target_path)
+        return self._target_snapshots
+
     def validate(self):
         """
         Ensure the destination exists.  Derived classes will want
-        to override this.
+        to override this (probably).
         We also need to create the datasets on target as necessary.
         This would be better with libzfs.
         """
@@ -290,12 +443,26 @@ class ZFSReplication(object):
                 subprocess.check_call(command, stdout=devnull, stderr=devnull)
         except subprocess.CalledProcessError:
             raise ZFSBackupError("Target {} does not exist".format(self.target))
-        # Okay, now let's start creating the dataset paths.  We create
-        # them readonly, starting below the pool name.  We don't care if it fails; the
-        # replication will fail later if we can't.
+        if not self.source_snapshots:
+            # A source with no snapshots cannot be backed up
+            raise ZFSBackupError("Source {} does not have snapshots".format(self.source))
+        
+        return
+
+    def backup_handler(self, stream):
+        """
+        Method called to write the backup to the target.  In the base class,
+        this simply creates the necessary datasets on the target, and then
+        creates a Popen subprocess for 'zfs recv' with the appropriate arguments,
+        and sets its stdin to stream.
+        Subclasses will probably want to replace this method.
+        """
+        # First we create the intervening dataset paths.  That is, the
+        # equivalent of 'mkdir -p ${target}/${source}'.
+        # We don't care if it fails.
         full_path = self.target
         with open("/dev/null", "w+") as devnull:
-            for d in self.dataset.split("/")[1:]:
+            for d in self.source.split("/")[1:]:
                 full_path = os.path.join(full_path, d)
                 command = ["/sbin/zfs", "create", "-o", "readonly=on", full_path]
                 print("Running command {}".format(" ".join(command)), file=sys.stderr)
@@ -303,24 +470,89 @@ class ZFSReplication(object):
                     subprocess.call(command, stdout=devnull, stderr=devnull)
                 except:
                     pass
+        # Now we just send the data to zfs recv.
+        destination = os.path.join(self.target, self.source)
+        # Do we need -p too?
+        command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
+        with tempfile.TemporaryFile() as error_output:
+            # ZFS->ZFS replication doesn't use filters.
+            fobj = source
+            try:
+                subprocess.check_call(command, stdin=fobj,
+                                      stderr=error_output)
+            except subprocess.CalledProcessError:
+                error_output.seek(0)
+                raise ZFSBackupError(error_output.read())
         return
 
-    def destroy(self, snapname):
+    def backup(self, snapname=None, force_full=False):
         """
-        Destroy (recursively, if set) a given snapshot.
+        Back up the source to the target.
+        If snapname is given, then that will be the snapshot used for the backup,
+        otherwise it will be the most recent snapshot.  If snapname is given and
+        does not exist, an exception is raised.
+
+        By default, it will first find a list of snapshots in common with the
+        source and target, ordered chronologically (based on the source).
+
+        If force_full is True, then the snapshot chosen will be sent in its entirety,
+        rather than trying to find a common ancestor for an incremental snapshot.
+
         """
-        full_path = os.path.join(self.target, *(self.dataset.split("/")[1:]))
-        command = ["/sbin/zfs", "destroy"]
-        if self.recursive:
-            command.append("-r")
-        command.append("{}@{}".format(full_path, snapname))
-        with open("/dev/null", "w+") as devnull:
-            try:
-                subprocess.check_call(command, stdout=devnull, stderr=devnull)
-            except subprocess.CalledProcessError:
-                raise ZFSBackupError("Unable to destroy snapshot {}@{}".format(full_path, snapname))
+        # First, if snapname is given, let's make sure that it exists on the source.
+        if snapname:
+            # If snapname has the dataset in it, let's remove it
+            if '@' in snapname:
+                (_, snapname) = snapname.split("@")
+            snap_index = None
+
+            for indx, d in enumerate(self.source_snapshots):
+                if d["Name"] == snapname:
+                    snap_index = indx
+                    break
+            if snap_index is None:
+                raise ZFSBackupError("Specified snapshot {} does not exist".foramt(snapname))
+            # We want to remove everything in source_snapshots up to the given one
+            source_snapshots = self.source_snapshots[0:snap_index+1]
+            last_snapshot = source_snapshots[-1]
+        else:
+            source_snapshots = self.source_snapshots
+            last_snapshot = source_snapshots[-1]
+            print("last_snapshot = {}".format(last_snapshot), file=sys.stderr)
+        if force_full:
+            common_snapshots = []
+        else:
+            common_snapshots = _merge_snapshots(source_snapshots, self.target_snapshots)
+        # At this point, common_snapshots has a list of snapshot names on both.
+        # If there are no common snapshots, then we back up everything up to last_snapshot
+        print("ZFSBackup: last_snapshot = {}, common_snapshots = {}".format(last_snapshot,
+                                                                            common_snapshots),
+              file=sys.stderr)
+        if last_snapshot["Name"] not in common_snapshots:
+            print("We have to do some sends/receives", file=sys.stderr)
+            # We need to do incremental snapshots from the last common snapshot to
+            # last_snapshot.
+            if common_snapshots:
+                # Don't bother doing this if we have no snapshots in common
+                last_common_snapshot = common_snapshots[-1]
+                print("Last common snapshot = {}".format(last_common_snapshot), file=sys.stderr)
+                for indx, snap in enumerate(source_snapshots):
+                    if snap["Name"] == last_common_snapshot:
+                        break
+                snapshot_list = source_snapshots[indx:]
+            else:
+                # Either it's been deleted on the remote end, or it's newer than the list.
+                # So we start at a full dump from last_snapshot
+                snapshot_list = [last_snapshot]
+        else:
+            snapshot_list = [last_snapshot]
+
+        print("We want to do a full snapshot of {}".format(snapshot_list[0]["Name"]), file=sys.stderr)
+        if len(snapshot_list) > 1:
+            print("\tAnd then incrementals of {}".format(" ".join([x["Name"] for x in snapshot_list[1:]])), file=sys.stderr)
         return
     
+
     def replicate(self, source, snapname, previous=None, date=int(time.time())):
         """
         Replicate from source.  source must be an object that supports
@@ -349,18 +581,6 @@ class ZFSReplication(object):
         return
     
     @property
-    def target(self):
-        return self._dest
-
-    @property
-    def dataset(self):
-        return self._ds
-
-    @property
-    def recursive(self):
-        return self._recursive
-    
-    @property
     def snapshots(self):
         """
         Return an array of snapshots for the destination.
@@ -387,22 +607,17 @@ class ZFSReplication(object):
             snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
         return snapshots
 
-class ZFSReplicationSSH(ZFSReplication):
-    def __init__(self, target, dataset, recursive=False, ssh_cmd=None):
-        pass
-    
-class ZFSReplicationCount(ZFSReplication):
-    def __init__(self, target, dataset, recursive=False):
-        super(ZFSReplicationCount, self).__init__(target, dataset, recursive)
+class ZFSBackupCount(ZFSBackup):
+    def __init__(self, source, target, recursive=False):
+        super(ZFSBackupCount, self).__init__(source, target, recursive)
         self._count = 0
         
     def __repr__(self):
-        return "{}({})".format(self.__class__.__name__, self.target)
-
+        return "{}(source={}, target={}, recursive={})".format(self.__class__.__name__,
+                                                               self.source,
+                                                               self.target,
+                                                               self.recursive)
     def validate(self):
-        return
-
-    def destroy(self, snapname):
         return
     
     def replicate(self, source, snapname, previous=None, date=int(time.time())):
@@ -411,7 +626,7 @@ class ZFSReplicationCount(ZFSReplication):
         """
         count = 0
         mByte = 1024 * 1024
-        fobj = self._filter(source)
+        fobj = self._filter_backup(source)
         while True:
             buf = fobj.read(mByte)
             if buf:
@@ -422,7 +637,7 @@ class ZFSReplicationCount(ZFSReplication):
         self._count = count
         
     @property
-    def snapshots(self):
+    def target_snapshots(self):
         return []
     @property
     def count(self):
@@ -444,7 +659,7 @@ def main():
                         default=False,
                         help='Recursively replicate')
     parser.add_argument('--snapshot', '-S', dest='snapshot_name',
-                        required=True,
+                        default=None,
                         help='Snapshot to replicate')
 
     parser.add_argument("--compressed", "-C", dest='compressed',
@@ -477,14 +692,18 @@ def main():
         print("No replication type method.  Valid types are zfs, counter", file=sys.stderr)
         sys.exit(1)
     elif args.subcommand == 'counter':
-        replicator = ZFSReplicationCount("<none>", dataset, recursive=args.recursive)
+        backup = ZFSBackupCount("<none>", dataset, recursive=args.recursive)
     elif args.subcommand == 'zfs':
-        replicator = ZFSReplication(args.destination, dataset, recursive=args.recursive)
+        backup = ZFSBackup(dataset, args.destination, recursive=args.recursive)
     else:
         print("Unknown replicator {}".format(args.subcommand), file=sys.stderr)
         sys.exit(1)
 
 
+    print("Doing backup {} -> {}".format(dataset, args.destination))
+    backup.backup(snapname=args.snapshot_name)
+    print("Done with backup");
+    sys.exit(0)
     if args.compressed:
         replicator.AddFilter("/usr/local/bin/pigz")
     command = ["/sbin/zfs", "send"]
