@@ -646,8 +646,8 @@ class ZFSBackup(object):
         return snapshots
 
 class ZFSBackupCount(ZFSBackup):
-    def __init__(self, source, target, recursive=False):
-        super(ZFSBackupCount, self).__init__(source, target, recursive)
+    def __init__(self, source, recursive=False):
+        super(ZFSBackupCount, self).__init__(source, "", recursive)
         self._count = 0
         
     def __repr__(self):
@@ -700,6 +700,10 @@ def main():
                         action='store_true', default=False,
                         help='Compress snapshots')
     
+    parser.add_argument('--pigz', action='store_true',
+                        dest='use_pigz', default=False,
+                        help='Use pigz to compress')
+    
     subparsers = parser.add_subparsers(help='sub-command help', dest='subcommand')
 
     # We have a sub parser for each type of replication
@@ -712,7 +716,6 @@ def main():
 
     counter_parser = subparsers.add_parser('counter',
                                            help='Count replication bytes')
-
     args = parser.parse_args()
     print("args = {}".format(args), file=sys.stderr)
     
@@ -726,7 +729,7 @@ def main():
         print("No replication type method.  Valid types are zfs, counter", file=sys.stderr)
         sys.exit(1)
     elif args.subcommand == 'counter':
-        backup = ZFSBackupCount(dataset, "<none>", recursive=args.recursive)
+        backup = ZFSBackupCount(dataset, recursive=args.recursive)
     elif args.subcommand == 'zfs':
         backup = ZFSBackup(dataset, args.destination, recursive=args.recursive)
     else:
@@ -734,37 +737,14 @@ def main():
         sys.exit(1)
 
     if args.compressed:
-        backup.AddFilter(ZFSBackupFilterCompressed(pigz=True))
-        
+        backup.AddFilter(ZFSBackupFilterCompressed(pigz=args.use_pigz))
+            
+    print("Starting backup of {}".format(dataset))
     backup.backup(snapname=args.snapshot_name)
     print("Done with backup");
 
     if isinstance(backup, ZFSBackupCount):
         print("{} bytes".format(backup.count))
-        
-    sys.exit(0)
-    if args.compressed:
-        replicator.AddFilter("/usr/local/bin/pigz")
-    command = ["/sbin/zfs", "send"]
-    if args.recursive:
-        command.append("-R")
-    command.append("{}@{}".format(dataset, snapname))
-
-    with tempfile.TemporaryFile() as error_output:
-        with open("/dev/null", "w+") as devnull:
-            mByte = 1024 * 1024
-            snap_io = subprocess.Popen(command,
-                                       bufsize=mByte,
-                                       stdin=devnull,
-                                       stderr=error_output,
-                                       stdout=subprocess.PIPE)
-            replicator.replicate(snap_io.stdout, snapname)
-        if snap_io.returncode:
-            error_output.seek(0)
-            print("`{}` failed: {}".format(command, error_output.read()), file=sys.stderr)
-            sys.exit(1)
-    if args.subcommand == 'counter':
-        print("Counted {} bytes".format(replicator.count))
         
 if __name__ == "__main__":
     main()
