@@ -30,6 +30,11 @@ def CHECK_OUTPUT(*args, **kwargs):
         print("CHECK_OUTPUT({}, {})".format(args, kwargs), file=sys.stderr)
     return subprocess.check_output(*args, **kwargs)
 
+def CALL(*args, **kwargs):
+    if debug:
+        print("CALL({}, {})".format(args, kwargs, file=sys.stderr))
+    return subprocess.call(*args, **kwargs)
+
 def CHECK_CALL(*args, **kwargs):
     if debug:
         print("CHECK_CALL({}, {})".format(args, kwargs), file=sys.stderr)
@@ -479,7 +484,7 @@ class ZFSBackup(object):
         
         return
 
-    def backup_handler(self, stream):
+    def backup_handler(self, stream, **kwargs):
         """
         Method called to write the backup to the target.  In the base class,
         this simply creates the necessary datasets on the target, and then
@@ -498,7 +503,7 @@ class ZFSBackup(object):
                 if debug:
                     print("Running command {}".format(" ".join(command)), file=sys.stderr)
                 try:
-                    subprocess.call(command, stdout=devnull, stderr=devnull)
+                    CALL(command, stdout=devnull, stderr=devnull)
                 except:
                     pass
         # Now we just send the data to zfs recv.
@@ -593,8 +598,14 @@ class ZFSBackup(object):
         command = ["/sbin/zfs", "send"]
         if self.recursive:
             command.append("-R")
+        backup_dict = {}
         if last_common_snapshot:
             command.extend(["-I", "{}".format(last_common_snapshot)])
+            backup_dict["incremental"] = True
+            backup_dict["parent"] = last_common_snapshot
+        else:
+            backup_dict["incremental"] = False
+        backup_dict["CreationTime"] = last_snapshot["CreationTime"]
         command.append("{}@{}".format(self.source, last_snapshot["Name"]))
         if debug:
             print(" ".join(command), file=sys.stderr)
@@ -607,7 +618,7 @@ class ZFSBackup(object):
                                   stdin=devnull,
                                   stderr=error_output,
                                   stdout=subprocess.PIPE)
-                self.backup_handler(send_proc.stdout)
+                self.backup_handler(send_proc.stdout, **backup_dict)
             if send_proc.returncode:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read())
@@ -668,6 +679,179 @@ class ZFSBackup(object):
             snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
         return snapshots
 
+class ZFSBackupSSH(ZFSBackup):
+    """
+    Replicate to a remote host using ssh.
+    This runs all of the commands the base class does, but via ssh
+    to another host.
+
+    When running a command on a remote host, we have the following
+    options:
+    1)  We don't care about input or output, only the return value.
+    2)  We stream to it, or from it.
+
+    (1) is mostly for validation -- ensure the target exists, and
+    we can connect to it.
+    For (2), we stream to it (writing to stdin), and don't care about
+    the output until after, for backup.
+    For (2), we stream _from_ it (reading from its stdout) when getting
+    a list of snapshots, and when doing a restore.
+    """
+    def __init__(self, source, target, remote_host,
+                 remote_user=None,
+                 ssh_opts=[],
+                 recursive=False):
+        self._user = remote_user
+        self._host = remote_host
+        self._ssh_opts = ssh_opts[:]
+        super(ZFSBackupSSH, self).__init__(source, target, recursive)
+
+    @property
+    def user(self):
+        return self._user
+    @property
+    def host(self):
+        return self._host
+    @property
+    def ssh_options(self):
+        return self._ssh_opts
+
+    def _build_command(self, cmd, *args):
+        # First set up ssh.
+        command = ["/usr/bin/ssh"]
+        if self.ssh_options:
+            command.extend(self.ssh_options)
+        if self.user:
+            command.append("{}@{}".format(self.user, self.host))
+        else:
+            command.append(self.host)
+            
+        # Then goes the rest of the command
+        command.append(cmd)
+        if args:
+            command.extend(args)
+        return command
+    
+    def _run_cmd(self, cmd, *args, **kwargs):
+        """
+        This implements running a command and not caring about
+        the output.  If stdout or stderr are given, those will
+        be file-like objects that the output and error are written
+        to.  If the command exists with a non-0 value, we raise an
+        exception.
+        """
+        command = self._build_command(cmd, *args)
+        try:
+            CHECK_CALL(command, **kwargs)
+        except subprocess.CalledProcessError:
+            raise ZFSBackupError("`{}` failed".format(command))
+
+    def _remote_stream(self, cmd, *args, **kwargs):
+        """
+        Run a command on the remote host, but we want to write to or read
+        from it.  We return a subprocess.Popen object, so the caller
+        needs to specify stdin=subprocess.PIPE, or stdout.  Both can't be pipes.
+        This should only be called by _remote_write or remote_stream
+        """
+        command = self._build_command(cmd, *args)
+        return POPEN(cmd[0], *cmd[1:], **kwargs)
+    
+    def _remote_write(self, cmd, *args, **kwargs):
+        """
+        Run a command on the remote host, writing to it via stdin.
+        """
+        # First remove stdin=, if it's there.
+        kwargs["stdin"] = subprocess.PIPE
+        return self._remote_stream(cmd, *args, **kwargs)
+    def _remote_read(self, cmd, *args, **kwargs):
+        """
+        Run a command on the remote host, reading its stdout.
+        """
+        # First remove stdout=, if it's there.
+        kwargs["stdout"] = subprocess.PIPE
+        return self._remote_stream(cmd, *args, **kwargs)
+
+    def validate(self):
+        """
+        Do a couple of validations.
+        """
+        # See if we can connect to the remote host
+        with tempfile.TemporaryFile() as error_output:
+            try:
+                self._run_cmd("/usr/bin/true", stderr=error_output)
+            except ZFSBackupError:
+                error_output.seek(0)
+                raise ZFSBackupError("Unable to connect to remote host: {}".format(error_output.read()))
+        # See if the target exists
+        with open("/dev/null", "w+") as devnull:
+            try:
+                self._run_cmd("/sbin/zfs", "list", "-H", self.target,
+                              stdout=devnull, stderr=devnull, stdin=devnull)
+            except ZFSBackupError:
+                raise ZFSBackupError("Target {} does not exist on remote host".format(self.target))
+
+        return
+
+    def backup_handler(self, stream, **kwargs):
+        """
+        Implement the replication.
+        This is not right yet:  we need to decompress and decrypt and dewhatever else
+        and do it by creating a pipeline on the remote end.
+        """
+
+        # First, we create the intervening dataset pats. See the base class' method.
+        full_path = self.target
+        with open("/dev/null", "w+") as devnull:
+            for d in self.source.split("/")[1:]:
+                full_path = os.path.join(full_path, d)
+                command = self._build_command("/sbin/zfs", "create", "-o", "readonly=on", full_path)
+                try:
+                    CALL(command, stdout=devnull, stderr=devnull, stdin=devnull)
+                except:
+                    pass
+                
+        # Here's where we would have to go through the filters, if any, and undo them.
+        # But some of the possible filters aren't needed, so I need a way to indicate that.
+        # For now, I'll simply assume uncompressed, unencrypted, etc.
+        command = self._build_command("/sbin/zfs", "receive", "-d", "-F", self.target)
+        with tempfile.TemporaryFile() as error_output:
+            # See above
+            fobj = stream
+            try:
+                CHECK_CALL(command, stdin=fobj, stderr=error_output)
+            except subprocess.CalledProcessError:
+                error_output.seek(0)
+                raise ZFSBackupError(error_output.read())
+
+        return
+    
+    @property
+    def target_snapshots(self):
+        if not self._target_snapshots:
+            (src_pool, _, src_ds) = self.source.partition("/")
+            if src_ds:
+                target_path = "{}/{}".format(self.target, src_ds)
+            else:
+                target_path = "{}/{}".format(self.target, src_pool)
+
+            command = self._build_command("/sbin/zfs", "list", "-H", "-p",
+                                          "-o", "name,creation", "-r",
+                                          "-d", "1", "-t", "snapshot", "-s",
+                                          "creation", target_path)
+            snapshots = []
+            try:
+                output = CHECK_OUTPUT(command).split("\n")
+                for snapshot in output:
+                    if not snapshot:
+                        continue
+                    (name, ctime) = snapshot.rstrip().split()
+                    name = name.split('@')[1]
+                    snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
+            except subprocess.CalledProcessError:
+                # We'll assume this is because there are no snapshots
+                pass
+            return snapshots
+        
 class ZFSBackupCount(ZFSBackup):
     def __init__(self, source, recursive=False):
         super(ZFSBackupCount, self).__init__(source, "", recursive)
@@ -680,7 +864,7 @@ class ZFSBackupCount(ZFSBackup):
     def validate(self):
         return
     
-    def backup_handler(self, stream):
+    def backup_handler(self, stream, **kwargs):
         count = 0
         mByte = 1024 * 1024
         fobj = self._filter_backup(stream)
@@ -744,6 +928,19 @@ def main():
 
     counter_parser = subparsers.add_parser('counter',
                                            help='Count replication bytes')
+
+    # ssh parser has a lot more options
+    ssh_parser = subparsers.add_parser("ssh",
+                                       help="Replicate to a remote ZFS server")
+    ssh_parser.add_argument('--dest', '-D', dest='destination',
+                            required=True,
+                            help='Pool/dataset target for replication')
+    ssh_parser.add_argument('--host', '-H', dest='remote_host',
+                            required=True,
+                            help='Remote hostname')
+    ssh_parser.add_argument("--user", '-U', dest='remote_user',
+                            help='Remote user (defaults to current user)')
+    
     args = parser.parse_args()
     debug = args.debug
 
@@ -763,6 +960,10 @@ def main():
         backup = ZFSBackupCount(dataset, recursive=args.recursive)
     elif args.subcommand == 'zfs':
         backup = ZFSBackup(dataset, args.destination, recursive=args.recursive)
+    elif args.subcommand == 'ssh':
+        backup = ZFSBackupSSH(dataset, args.destination, args.remote_host,
+                              remote_user=args.remote_user,
+                              recursive=args.recursive)
     else:
         print("Unknown replicator {}".format(args.subcommand), file=sys.stderr)
         sys.exit(1)
