@@ -674,10 +674,9 @@ class ZFSBackupCount(ZFSBackup):
         self._count = 0
         
     def __repr__(self):
-        return "{}(source={}, target={}, recursive={})".format(self.__class__.__name__,
-                                                               self.source,
-                                                               self.target,
-                                                               self.recursive)
+        return "{}(source={}, recursive={})".format(self.__class__.__name__,
+                                                    self.source,
+                                                    self.recursive)
     def validate(self):
         return
     
