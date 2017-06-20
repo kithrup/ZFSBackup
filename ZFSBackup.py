@@ -549,15 +549,15 @@ class ZFSBackup(object):
                     snap_index = indx
                     break
             if snap_index is None:
-                raise ZFSBackupError("Specified snapshot {} does not exist".foramt(snapname))
+                raise ZFSBackupError("Specified snapshot {} does not exist".format(snapname))
             # We want to remove everything in source_snapshots up to the given one
             source_snapshots = self.source_snapshots[0:snap_index+1]
         else:
             source_snapshots = self.source_snapshots
-            if debug:
-                print("last_snapshot = {}".format(last_snapshot), file=sys.stderr)
             
         last_snapshot = source_snapshots[-1]
+        if debug:
+            print("last_snapshot = {}".format(last_snapshot), file=sys.stderr)
         last_common_snapshot = None
         if force_full:
             common_snapshots = []
@@ -951,7 +951,8 @@ def main():
         (dataset, snapname) = args.snapshot_name.split('@')
     except ValueError:
         print("Invalid snapshot name {}".format(args.snapshot_name), file=sys.stderr)
-        sys.exit(1)
+        dataset = args.snapshot_name
+        snapname = None
         
     if args.subcommand is None:
         print("No replication type method.  Valid types are zfs, counter", file=sys.stderr)
@@ -973,7 +974,7 @@ def main():
             
     if args.verbose:
         print("Starting backup of {}".format(dataset))
-    backup.backup(snapname=args.snapshot_name)
+    backup.backup(snapname=snapname)
     if args.verbose:
         print("Done with backup");
 
