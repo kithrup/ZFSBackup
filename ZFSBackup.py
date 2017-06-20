@@ -5,6 +5,8 @@ import time
 import tempfile
 import threading
 
+debug = True
+
 def _merge_snapshots(list1, list2):
     """
     Given a list of snapshots, return a list of
@@ -14,17 +16,29 @@ def _merge_snapshots(list1, list2):
     they have the same name!
     """
     rv = []
-#    print("list1 names = {}".format([el["Name"] for el in list1]), file=sys.stderr)
-#    print("list2 names = {}".format([el["Name"] for el in list2]), file=sys.stderr)
     if list2:
         dict2 = dict((el["Name"], True) for el in list2)
         for snapname in [x["Name"] for x in list1]:
- #           print("Checking snapname {}".format(snapname), file=sys.stderr)
             if snapname in dict2:
                 rv.append(snapname)
             else:
-                pass; #print("\tNot in list2?")
+                pass;
     return rv
+
+def CHECK_OUTPUT(*args, **kwargs):
+    if debug:
+        print("CHECK_OUTPUT({}, {})".format(args, kwargs), file=sys.stderr)
+    return subprocess.check_output(*args, **kwargs)
+
+def CHECK_CALL(*args, **kwargs):
+    if debug:
+        print("CHECK_CALL({}, {})".format(args, kwargs), file=sys.stderr)
+    return subprocess.check_call(*args, **kwargs)
+
+def POPEN(*args, **kwargs):
+    if debug:
+        print("POPEN({}, {})".format(args, kwargs), file=sys.stderr)
+    return subprocess.Popen(*args, **kwargs)
 
 def _get_snapshots(ds):
     """
@@ -35,9 +49,10 @@ def _get_snapshots(ds):
     command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation",
                "-r", "-d", "1", "-t", "snapshot", "-s", "creation",
                ds]
-    print("get_snapshots: {}".format(" ".join(command)), file=sys.stderr)
+    if debug:
+        print("get_snapshots: {}".format(" ".join(command)), file=sys.stderr)
     try:
-        output = subprocess.check_output(command).split("\n")
+        output = CHECK_OUTPUT(command).split("\n")
     except subprocess.CalledProcessError:
         # We'll assume this is because there are no snapshots
         return []
@@ -185,9 +200,10 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
     in a Popen instance.  The error parameter in the constructor is
     used to indicate where stderr should go; by default, it goes to
     /dev/null
+    If restore_command is None, then backup_command will be used.
     """
-    def __init__(self, backup_command=["/bin/cat"],
-                 restore_command=["/bin/cat"], error=None):
+    def __init__(self, backup_command=["/bin/cat"], restore_command=None,
+                 error=None):
         super(ZFSBackupFilterCommand, self).__init__()
         self._backup_command=backup_command
         self._restore_command=restore_command
@@ -198,7 +214,7 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
         return self._backup_command
     @property
     def restore_command(self):
-        return self._restore_command
+        return self._restore_command or self.backup_command
     @property
     def error_output(self):
         return self._error_output
@@ -218,11 +234,11 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
         """
         if self.error is None:
             self.error = open("/dev/null", "w+")
-        p = subprocess.Popen(self.restore_command,
-                             bufsize=1024 * 1024,
-                             stdin=source,
-                             stdout=subprocess.PIPE,
-                             stderr=self.error)
+        p = POPEN(self.restore_command,
+                  bufsize=1024 * 1024,
+                  stdin=source,
+                  stdout=subprocess.PIPE,
+                  stderr=self.error)
         return p.stdout
     
     def start_backup(self, source):
@@ -236,11 +252,11 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
         """
         if self.error is None:
             self.error = open("/dev/null", "w+")
-        p = subprocess.Popen(self.backup_command,
-                             bufsize=1024 * 1024,
-                             stderr=self.error,
-                             stdin=source,
-                             stdout=subprocess.PIPE)
+        p = POPEN(self.backup_command,
+                  bufsize=1024 * 1024,
+                  stderr=self.error,
+                  stdin=source,
+                  stdout=subprocess.PIPE)
         return p.stdout
     
 class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
@@ -454,7 +470,7 @@ class ZFSBackup(object):
         command = ["/sbin/zfs", "list", "-H", self.target]
         try:
             with open("/dev/null", "w") as devnull:
-                subprocess.check_call(command, stdout=devnull, stderr=devnull)
+                CHECK_CALL(command, stdout=devnull, stderr=devnull)
         except subprocess.CalledProcessError:
             raise ZFSBackupError("Target {} does not exist".format(self.target))
         if not self.source_snapshots:
@@ -479,7 +495,8 @@ class ZFSBackup(object):
             for d in self.source.split("/")[1:]:
                 full_path = os.path.join(full_path, d)
                 command = ["/sbin/zfs", "create", "-o", "readonly=on", full_path]
-                print("Running command {}".format(" ".join(command)), file=sys.stderr)
+                if debug:
+                    print("Running command {}".format(" ".join(command)), file=sys.stderr)
                 try:
                     subprocess.call(command, stdout=devnull, stderr=devnull)
                 except:
@@ -491,7 +508,7 @@ class ZFSBackup(object):
             # ZFS->ZFS replication doesn't use filters.
             fobj = stream
             try:
-                subprocess.check_call(command, stdin=fobj,
+                CHECK_CALL(command, stdin=fobj,
                                       stderr=error_output)
             except subprocess.CalledProcessError:
                 error_output.seek(0)
@@ -532,7 +549,8 @@ class ZFSBackup(object):
             source_snapshots = self.source_snapshots[0:snap_index+1]
         else:
             source_snapshots = self.source_snapshots
-            print("last_snapshot = {}".format(last_snapshot), file=sys.stderr)
+            if debug:
+                print("last_snapshot = {}".format(last_snapshot), file=sys.stderr)
             
         last_snapshot = source_snapshots[-1]
         last_common_snapshot = None
@@ -542,17 +560,20 @@ class ZFSBackup(object):
             common_snapshots = _merge_snapshots(source_snapshots, self.target_snapshots)
         # At this point, common_snapshots has a list of snapshot names on both.
         # If there are no common snapshots, then we back up everything up to last_snapshot
-        print("ZFSBackup: last_snapshot = {}, common_snapshots = {}".format(last_snapshot,
-                                                                            common_snapshots),
-              file=sys.stderr)
+        if debug:
+            print("ZFSBackup: last_snapshot = {}, common_snapshots = {}".format(last_snapshot,
+                                                                                common_snapshots),
+                  file=sys.stderr)
         if last_snapshot["Name"] not in common_snapshots:
-            print("We have to do some sends/receives", file=sys.stderr)
+            if debug:
+                print("We have to do some sends/receives", file=sys.stderr)
             # We need to do incremental snapshots from the last common snapshot to
             # last_snapshot.
             if common_snapshots:
                 # Don't bother doing this if we have no snapshots in common
                 last_common_snapshot = common_snapshots[-1]
-                print("Last common snapshot = {}".format(last_common_snapshot), file=sys.stderr)
+                if debug:
+                    print("Last common snapshot = {}".format(last_common_snapshot), file=sys.stderr)
                 for indx, snap in enumerate(source_snapshots):
                     if snap["Name"] == last_common_snapshot:
                         break
@@ -575,16 +596,17 @@ class ZFSBackup(object):
         if last_common_snapshot:
             command.extend(["-I", "{}".format(last_common_snapshot)])
         command.append("{}@{}".format(self.source, last_snapshot["Name"]))
-        print(" ".join(command), file=sys.stderr)
+        if debug:
+            print(" ".join(command), file=sys.stderr)
 
         with tempfile.TemporaryFile() as error_output:
             with open("/dev/null", "w+") as devnull:
                 mByte = 1024 * 1024
-                send_proc = subprocess.Popen(command,
-                                             bufsize=mByte,
-                                             stdin=devnull,
-                                             stderr=error_output,
-                                             stdout=subprocess.PIPE)
+                send_proc = POPEN(command,
+                                  bufsize=mByte,
+                                  stdin=devnull,
+                                  stderr=error_output,
+                                  stdout=subprocess.PIPE)
                 self.backup_handler(send_proc.stdout)
             if send_proc.returncode:
                 error_output.seek(0)
@@ -609,12 +631,13 @@ class ZFSBackup(object):
             # fobj = self._filter(source, error=error_output)
             fobj = source
             try:
-                subprocess.check_call(command, stdin=fobj, stderr=error_output)
+                CHECK_CALL(command, stdin=fobj, stderr=error_output)
             except subprocess.CalledProcessError:
                 name = "{}@{}".format(self.dataset, snapname)
                 error_output.seek(0)
-                print("`{}` failed: {}".format(" ".join(command), error_output.read()),
-                      file=sys.stderr)
+                if debug:
+                    print("`{}` failed: {}".format(" ".join(command), error_output.read()),
+                          file=sys.stderr)
                 raise ZFSBackupError("Could not replicate {} to target {}".format(name, self.target))
         return
     
@@ -678,6 +701,7 @@ class ZFSBackupCount(ZFSBackup):
         return self._count
     
 def main():
+    global debug
     import argparse
 
     def to_bool(s):
@@ -688,6 +712,11 @@ def main():
     parser = argparse.ArgumentParser(description='ZFS snapshot replictor')
     parser.register('type', 'bool', to_bool)
     
+    parser.add_argument("--debug", dest='debug',
+                        action='store_true', default=False,
+                        help='Turn on debugging')
+    parser.add_argument("--verbose", dest='verbose', action='store_true',
+                        default=False, help='Be verbose')
     parser.add_argument('--recursive', '-R', dest='recursive',
                         type=bool,
                         default=False,
@@ -717,7 +746,10 @@ def main():
     counter_parser = subparsers.add_parser('counter',
                                            help='Count replication bytes')
     args = parser.parse_args()
-    print("args = {}".format(args), file=sys.stderr)
+    debug = args.debug
+
+    if debug:
+        print("args = {}".format(args), file=sys.stderr)
     
     try:
         (dataset, snapname) = args.snapshot_name.split('@')
@@ -739,9 +771,11 @@ def main():
     if args.compressed:
         backup.AddFilter(ZFSBackupFilterCompressed(pigz=args.use_pigz))
             
-    print("Starting backup of {}".format(dataset))
+    if args.verbose:
+        print("Starting backup of {}".format(dataset))
     backup.backup(snapname=args.snapshot_name)
-    print("Done with backup");
+    if args.verbose:
+        print("Done with backup");
 
     if isinstance(backup, ZFSBackupCount):
         print("{} bytes".format(backup.count))
