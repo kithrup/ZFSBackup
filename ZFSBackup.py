@@ -83,9 +83,16 @@ class ZFSBackupFilter(object):
     should use a subprocess or thread, unless they
     are the terminus of the pipeline.  (Doing otherwise
     risks deadlock.)
+    
+    The transformative property indicates that the filter transforms
+    the data as it processes it.  Some filters don't -- the counter
+    filter, for example.  This is important for some ZFSBackups subclasses,
+    such as ZFSBackupSSH, which need to apply transformative filters on
+    the other end as part of the backup and restore.  By default, it's
+    true; subclasses can change it, and the object can alter it.
     """
     def __init__(self):
-        pass
+        self.transformative = True
 
     @property
     def error_output(self):
@@ -97,6 +104,13 @@ class ZFSBackupFilter(object):
     @property
     def name(self):
         return "Null Filter"
+
+    @property
+    def transformative(self):
+        return self._transformative
+    @transformative.setter
+    def transformative(self, b):
+        self._transformative = b
 
     @property
     def backup_command(self):
@@ -144,11 +158,16 @@ class ZFSBackupFilterThread(ZFSBackupFilter, threading.Thread):
             self._name = name
 
     @property
+    def transformative(self):
+        return False
+    
+    @property
     def backup_command(self):
-        return ["<thread>"]
+        return None
+
     @property
     def restore_command(self):
-        return ["<thread>"]
+        return None
     
     @property
     def input_pipe(self):
@@ -173,7 +192,9 @@ class ZFSBackupFilterThread(ZFSBackupFilter, threading.Thread):
         # Subclasses should do any processing here
         if self._process:
             return self._process(buf)
-    
+        else:
+            return buf
+        
     def run(self):
         while True:
             b = self.source.read(1024*1024)
@@ -413,6 +434,8 @@ class ZFSBackup(object):
         input = source
         for f in self._filters:
             f.error_output = error
+            if debug:
+                print("Starting filter {} ({})".format(f.name, f.backup_command), file=sys.stderr)
             input = f.start_backup(input)
         return input
     
@@ -639,7 +662,6 @@ class ZFSBackup(object):
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
         with tempfile.TemporaryFile() as error_output:
             # ZFS->ZFS replication doesn't use filters.
-            # fobj = self._filter(source, error=error_output)
             fobj = source
             try:
                 CHECK_CALL(command, stdin=fobj, stderr=error_output)
@@ -810,13 +832,17 @@ class ZFSBackupSSH(ZFSBackup):
                 except:
                     pass
                 
-        # Here's where we would have to go through the filters, if any, and undo them.
-        # But some of the possible filters aren't needed, so I need a way to indicate that.
-        # For now, I'll simply assume uncompressed, unencrypted, etc.
-        command = self._build_command("/sbin/zfs", "receive", "-d", "-F", self.target)
+        # If we have any transformative filters, we need to create them in reverse order.
+        command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
+        for filter in reversed(self._filters):
+            if filter.transformative and filter.restore_command:
+                command = filter.restore_command + ["|"] + command
+                
+        command = self._build_command(*command)
+        if debug:
+            print("backup command = {}".format(command), file=sys.stderr)
         with tempfile.TemporaryFile() as error_output:
-            # See above
-            fobj = stream
+            fobj = self._filter_backup(stream, error=error_output)
             try:
                 CHECK_CALL(command, stdin=fobj, stderr=error_output)
             except subprocess.CalledProcessError:
