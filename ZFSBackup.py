@@ -189,8 +189,8 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
     def __init__(self, backup_command=["/bin/cat"],
                  restore_command=["/bin/cat"], error=None):
         super(ZFSBackupFilterCommand, self).__init__()
-        self._backup_command=backup_command.copy()
-        self._restore_command=restore_command.copy()
+        self._backup_command=backup_command
+        self._restore_command=restore_command
         self.error = error
         
     @property
@@ -243,6 +243,22 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
                              stdout=subprocess.PIPE)
         return p.stdout
     
+class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
+    """
+    A sample command filter, for compressing.
+    One optional parameter:  pigz.
+    """
+    def __init__(self, pigz=False):
+        if pigz:
+            backup_command = "/usr/local/bin/pigz"
+            restore_command = "/usr/local/bin/unpigz"
+        else:
+            backup_command = "/usr/bin/gzip"
+            restore_command = "/usr/bin/gunzip"
+            
+        super(ZFSBackupFilterCompressed, self).__init__(backup_command=[backup_command],
+                                                        restore_command=[restore_command])
+            
 class ZFSBackupFilterCounter(ZFSBackupFilterThread):
     """
     A sample thread filter.  All this does is count the
@@ -434,8 +450,6 @@ class ZFSBackup(object):
         """
         Ensure the destination exists.  Derived classes will want
         to override this (probably).
-        We also need to create the datasets on target as necessary.
-        This would be better with libzfs.
         """
         command = ["/sbin/zfs", "list", "-H", self.target]
         try:
@@ -471,12 +485,11 @@ class ZFSBackup(object):
                 except:
                     pass
         # Now we just send the data to zfs recv.
-        destination = os.path.join(self.target, self.source)
         # Do we need -p too?
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
         with tempfile.TemporaryFile() as error_output:
             # ZFS->ZFS replication doesn't use filters.
-            fobj = source
+            fobj = stream
             try:
                 subprocess.check_call(command, stdin=fobj,
                                       stderr=error_output)
@@ -498,6 +511,9 @@ class ZFSBackup(object):
         If force_full is True, then the snapshot chosen will be sent in its entirety,
         rather than trying to find a common ancestor for an incremental snapshot.
 
+        This is the main driver of the backup process, and subclasses should be okay
+        with using it.
+
         """
         # First, if snapname is given, let's make sure that it exists on the source.
         if snapname:
@@ -514,11 +530,12 @@ class ZFSBackup(object):
                 raise ZFSBackupError("Specified snapshot {} does not exist".foramt(snapname))
             # We want to remove everything in source_snapshots up to the given one
             source_snapshots = self.source_snapshots[0:snap_index+1]
-            last_snapshot = source_snapshots[-1]
         else:
             source_snapshots = self.source_snapshots
-            last_snapshot = source_snapshots[-1]
             print("last_snapshot = {}".format(last_snapshot), file=sys.stderr)
+            
+        last_snapshot = source_snapshots[-1]
+        last_common_snapshot = None
         if force_full:
             common_snapshots = []
         else:
@@ -547,11 +564,32 @@ class ZFSBackup(object):
         else:
             snapshot_list = [last_snapshot]
 
-        print("We want to do a full snapshot of {}".format(snapshot_list[0]["Name"]), file=sys.stderr)
-        if len(snapshot_list) > 1:
-            print("\tAnd then incrementals of {}".format(" ".join([x["Name"] for x in snapshot_list[1:]])), file=sys.stderr)
+        # There are two approaches that could be done here.
+        # One is to do incremental sends for every snapshot; the other
+        # is simply to do a send -I.  I'm choosing the latter.
+        # If we have a last common snapshot, we can do an incremental from it to
+        # the last snapshot; if we don't, we'll need to do a full send.
+        command = ["/sbin/zfs", "send"]
+        if self.recursive:
+            command.append("-R")
+        if last_common_snapshot:
+            command.extend(["-I", "{}".format(last_common_snapshot)])
+        command.append("{}@{}".format(self.source, last_snapshot["Name"]))
+        print(" ".join(command), file=sys.stderr)
+
+        with tempfile.TemporaryFile() as error_output:
+            with open("/dev/null", "w+") as devnull:
+                mByte = 1024 * 1024
+                send_proc = subprocess.Popen(command,
+                                             bufsize=mByte,
+                                             stdin=devnull,
+                                             stderr=error_output,
+                                             stdout=subprocess.PIPE)
+                self.backup_handler(send_proc.stdout)
+            if send_proc.returncode:
+                error_output.seek(0)
+                raise ZFSBackupError(error_output.read())
         return
-    
 
     def replicate(self, source, snapname, previous=None, date=int(time.time())):
         """
@@ -620,22 +658,18 @@ class ZFSBackupCount(ZFSBackup):
     def validate(self):
         return
     
-    def replicate(self, source, snapname, previous=None, date=int(time.time())):
-        """
-        Just count the characters
-        """
+    def backup_handler(self, stream):
         count = 0
         mByte = 1024 * 1024
-        fobj = self._filter_backup(source)
+        fobj = self._filter_backup(stream)
         while True:
-            buf = fobj.read(mByte)
-            if buf:
-                count += len(buf)
+            b = fobj.read(mByte)
+            if b:
+                count += len(b)
             else:
                 break
-            
         self._count = count
-        
+
     @property
     def target_snapshots(self):
         return []
@@ -692,17 +726,22 @@ def main():
         print("No replication type method.  Valid types are zfs, counter", file=sys.stderr)
         sys.exit(1)
     elif args.subcommand == 'counter':
-        backup = ZFSBackupCount("<none>", dataset, recursive=args.recursive)
+        backup = ZFSBackupCount(dataset, "<none>", recursive=args.recursive)
     elif args.subcommand == 'zfs':
         backup = ZFSBackup(dataset, args.destination, recursive=args.recursive)
     else:
         print("Unknown replicator {}".format(args.subcommand), file=sys.stderr)
         sys.exit(1)
 
-
-    print("Doing backup {} -> {}".format(dataset, args.destination))
+    if args.compressed:
+        backup.AddFilter(ZFSBackupFilterCompressed(pigz=True))
+        
     backup.backup(snapname=args.snapshot_name)
     print("Done with backup");
+
+    if isinstance(backup, ZFSBackupCount):
+        print("{} bytes".format(backup.count))
+        
     sys.exit(0)
     if args.compressed:
         replicator.AddFilter("/usr/local/bin/pigz")
