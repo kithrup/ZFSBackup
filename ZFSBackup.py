@@ -1,10 +1,12 @@
 from __future__ import print_function
 import os, sys
+import json
 import subprocess
 import time
 import tempfile
 import threading
 import StringIO
+import errno
 
 debug = True
 
@@ -622,7 +624,7 @@ class ZFSBackup(object):
         command = ["/sbin/zfs", "send"]
         if self.recursive:
             command.append("-R")
-        backup_dict = {}
+        backup_dict = { "Name": last_snapshot["Name"] }
         if last_common_snapshot:
             command.extend(["-I", "{}".format(last_common_snapshot)])
             backup_dict["incremental"] = True
@@ -702,6 +704,184 @@ class ZFSBackup(object):
             snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
         return snapshots
 
+class ZFSBackupDirectory(ZFSBackup):
+    """
+    A variant of ZFSBackup that backs up to files, rather than replication.
+    The layout used is:
+     target/
+      prefix/
+       map.json
+      chunks/
+       data files
+
+    prefix will default to the hostname if none is given.
+    target is the root pathname -- note that this doesn't need to be
+    a ZFS filesystem.
+
+    The map file maps from dataset to snapshots.
+    Since some filesystems (I'm looking at you, msdos) have a
+    limit of 4gb, we'll keep chunks limited to 2gb.
+
+    Each dataset has a chronologically-ordered array of
+    snapshots.
+
+    A snapshot entry in the map contains the name, the
+    creation time, whether it is recursive, and, if it
+    is an incremental snapshot, what the previous one was.
+    It also contains the names of the chunks, and any transformative
+    filter commands (in order to restore it).
+    
+    """
+    def __init__(self, source, target, prefix=None, recursive=False):
+        import socket
+        self._prefix = prefix or socket.gethostname()
+        self._mapfile = None
+        super(ZFSBackupDirectory, self).__init__(source, target, recursive)
+
+
+    def __repr__(self):
+        return "{}({}, {}, prefix={}, recursive={})".format(self.__class__.__name__,
+                                                            self.source, self.target,
+                                                            self.prefix, self.recursive)
+    
+    def validate(self):
+        """
+        Ensure that the destination exists.  Since this is just
+        using files, all we need is os.path.exists
+        """
+        if not os.path.exists(self.target):
+            raise ZFSBackupError("Target {} does not exist".format(self.target))
+        return
+
+    @property
+    def mapfile(self):
+        """
+        Return the mapfile.  If it isn't loaded, we load it now.
+        """
+        if self._mapfile is None:
+            mapfile_path = os.path.join(self.target, self.prefix, "map.json")
+            try:
+                with open(mapfile_path, "r") as mapfile:
+                    self._mapfile = json.load(mapfile)
+            except:
+                # I know, blanket catch, shouldn't do that
+                self._mapfile = {}
+
+        return self._mapfile
+    @mapfile.setter
+    def mapfile(self, d):
+        if debug:
+            print("Setting mapfile to {}".format(d), file=sys.stderr)
+        if not self._mapfile or self._mapfile != d:
+            self._mapfile = d
+            self._save_mapfile()
+            
+    def _save_mapfile(self):
+        """
+        Save the map file.
+        """
+        if self._mapfile:
+            mapfile_path = os.path.join(self.target, self.prefix, "map.json")
+            if debug:
+                print("Saving map file to {}".format(mapfile_path), file=sys.stderr)
+            with open(mapfile_path, "w") as mapfile:
+                json.dump(self._mapfile, mapfile,
+                          sort_keys=True,
+                          indent=4, separators=(',', ': '))
+
+    @property
+    def target_snapshots(self):
+        """
+        The snapshots are in the mapfile.
+        First key we care about is the source dataset.
+        """
+        map = self.mapfile
+        if self.source in map:
+            return map[self.source]
+        else:
+            return []
+
+    def backup_handler(self, stream, **kwargs):
+        import binascii
+        # Write the backup to the target.  In our case, we're
+        # doing a couple of things:
+        # First, we need to make sure the full target directory
+        # exists -- create it if necessary.
+
+        # Sanity check: unlike the base class, we need to
+        # know the name of the snapshot, and whether it's incremental.
+        # If it is, we also need to know the previous one
+
+        snapshot_name = kwargs.get("Name", None)
+        incremental = kwargs.get("incremental", None)
+        parent = kwargs.get("parent", None)
+
+        if snapshot_name is None:
+            raise ZFSBackupError("Missing name of snapshot")
+
+        if incremental is None:
+            raise ZFSBackupError("Missing incremental information about snapshot")
+
+        # Next sanity check: if this snapshot is already in the map, abort
+        source_map = self.mapfile.get(self.source, {})
+        current_snapshots = source_map.get("snapshots", [])
+        
+        for x in current_snapshots:
+            if x["Name"] == snapshot_name:
+                raise ZFSBackupError("Snapshot {} is already present in target".format(snapshot_name))
+        
+        base_path = os.path.join(self.target, self.prefix)
+        chunk_dir = os.path.join(self.target, "chunks")
+        for d in (base_path, chunk_dir):
+            try:
+                os.makedirs(d)
+            except OSError as e:
+                if e.errno != errno.EEXIST:
+                    raise
+
+        filters = []
+        for f in reversed(self._filters):
+            if f.transformative and f.restore_command:
+                filters.append(f.restore_command)
+                
+        # Now we need to start writing chunks, keeping track of their names.
+        chunks = []
+        mByte = 1024 * 1024
+        gByte = 1024 * mByte
+        done = False
+        while not done:
+            with tempfile.NamedTemporaryFile(dir=chunk_dir, delete=False) as chunk:
+                chunks.append(os.path.join("chunk", os.path.basename(chunk.name)))
+                total = 0
+                while total < 2*gByte:
+                    buf = stream.read(mByte)
+                    if not buf:
+                        done = True
+                        break
+                    chunk.write(buf)
+                    total += len(buf)
+        # Now we need to update the map to have the chunks.
+        snapshot_dict = {
+            "Name" : snapshot_name,
+            "CreationTime" : kwargs.get("CreationTime", int(time.time())),
+            "incremental": incremental,
+            "chunks" : chunks
+        }
+        if incremental:
+            snapshot_dict["parent"] = parent
+        if filters:
+            snapshot_dict["filters"] = filters
+            
+        current_snapshots.append(snapshot_dict)
+        source_map["snapshots"] = current_snapshots
+        self.mapfile[self.source] = source_map
+        self._save_mapfile()
+        
+                    
+    @property
+    def prefix(self):
+        return self._prefix
+    
 class ZFSBackupS3(ZFSBackup):
     """
     Backup to AWS.  Optionally with transitions to glacier.
@@ -1051,10 +1231,15 @@ def main():
                         type=bool,
                         default=False,
                         help='Recursively replicate')
-    parser.add_argument('--snapshot', '-S', dest='snapshot_name',
-                        default=None,
-                        help='Snapshot to replicate')
-
+    group = parser.add_mutually_exclusive_group(required=True)
+    
+    group.add_argument('--snapshot', '-S', dest='snapshot_name',
+                       default=None,
+                       help='Snapshot to backup')
+    group.add_argument('--dataset', '--pool', dest='snapshot_name',
+                       default=None,
+                       help='Dataset or pool to back up')
+    
     parser.add_argument("--compressed", "-C", dest='compressed',
                         action='store_true', default=False,
                         help='Compress snapshots')
@@ -1088,6 +1273,14 @@ def main():
     ssh_parser.add_argument("--user", '-U', dest='remote_user',
                             help='Remote user (defaults to current user)')
     
+    # Directory parser has only two options
+    directory_parser = subparsers.add_parser("directory",
+                                        help='Save snapshots to a directory')
+    directory_parser.add_argument("--dest", "-D", dest='destination', required=True,
+                                  help='Path to store snapshots')
+    directory_parser.add_argument("--prefix", "-P", dest='prefix', default=None,
+                                  help='Prefix to use when saving snapshots (defaults to hostname)')
+    
     args = parser.parse_args()
     debug = args.debug
 
@@ -1112,6 +1305,9 @@ def main():
         backup = ZFSBackupSSH(dataset, args.destination, args.remote_host,
                               remote_user=args.remote_user,
                               recursive=args.recursive)
+    elif args.subcommand == 'directory':
+        backup = ZFSBackupDirectory(dataset, args.destination, recursive=args.recursive,
+                                    prefix=args.prefix)
     else:
         print("Unknown replicator {}".format(args.subcommand), file=sys.stderr)
         sys.exit(1)
