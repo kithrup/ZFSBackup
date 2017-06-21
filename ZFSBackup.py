@@ -4,6 +4,7 @@ import subprocess
 import time
 import tempfile
 import threading
+import StringIO
 
 debug = True
 
@@ -701,6 +702,126 @@ class ZFSBackup(object):
             snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
         return snapshots
 
+class ZFSBackupS3(ZFSBackup):
+    """
+    Backup to AWS.  Optionally with transitions to glacier.
+    The layout used is:
+     bucket/
+      prefix/
+       map.json
+      glacier/
+
+    The map file maps from dataset to snapshots.
+    A glacier file is limited to 40tb (and S3 to 5tb),
+    so we'll actually break the snapshots into 1gbyte
+    chunks.
+
+    Each dataset has a chronologically-ordered array of
+    snapshots.
+
+    A snapshot entry in the map contains the name, the
+    creation time, whether it is recursive, and, if it
+    is an incremental snapshot, what the previous one was.
+    It also contains the names of the chunks.
+
+    So it looks something like:
+
+    "tank" : [
+	"auto-daily-2017-01-01:00:00" : {
+	    "CreationTime" : 12345678,
+            "Size"         : 1024000,
+            "Recursive"    : True,
+            "Incremental"  : null,
+	    "Chunks"       : [
+		"glacier/${random}",
+		"glacier/${random}"
+	    ]
+         },
+	"auto-daily-2017-01-02:00:00" : {
+	...
+	}
+    ]
+
+    Each dataset being backed up has an entry in the map file.
+    """
+    import boto3
+    import botocore
+    
+    def __init__(self, source,
+                 bucket, s3_key, s3_secret,
+                 recursive=False,
+                 prefix=None, region=None, glacier=True):
+        """
+        Backing up to S3 requires a key, secret, and bucket.
+        If prefix is none, it will use the current hostname.
+        (As a result, prefix must be unique within the bucket.)
+
+        If the bucket doesn't exist, it gets created; if
+        glacier is True, then it will set up a transition rule.
+
+        Note that bucket names need to be globally unique.
+        """
+        import socket
+        
+        self._map = None
+        self._glacier = glacier
+
+        self._s3 = boto3.resource('s3', aws_access_key_id=s3_key,
+                                  aws_secret_access_key=s3_secret,
+                                  region_name=region)
+        try:
+            s3.meta.client.head_bucket(Bucket=bucket)
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]['Code'] == '404':
+                # Need to create the bucket
+                pass
+            else:
+                raise
+        self._prefix = prefix or socket.gethostname()
+        # We'll over-load prefix here
+        super(ZFSBackupS3, self).__init__(source, prefix, recursive)
+        
+    @property
+    def glacier(self):
+        return self._glacier
+    @property
+    def prefix(self):
+        return self._prefix
+    @property
+    def s3(self):
+        return self._s3
+
+    @property
+    def bucket(self):
+        return self._bucket
+    @bucket.setter
+    def bucket(self, b):
+        self._bucket = b
+        
+    def _loadmap(self):
+        """
+        Load the map file from the bucket.  We cache it so we
+        don't keep reloading it.
+        """
+        if self._map is None:
+            # We need to make sure the bucket exists.
+            map_path = "{}/map.json".format(self.prefix)
+            map_file = StringIO.StringIO()
+            s3.download_fileobj(self.bucket, map_path, map_file)
+            
+    def validate(self):
+        """
+        We don't do a lot of validation, since s3 costs per usage.
+        We'll lazily check the bucket, and create it if necessary.
+        """
+        return
+    
+    def AvailableRegions():
+        """
+        List the available regons.
+        """
+        return boto3.session.Session().get_available_regions('s3')
+    
 class ZFSBackupSSH(ZFSBackup):
     """
     Replicate to a remote host using ssh.
