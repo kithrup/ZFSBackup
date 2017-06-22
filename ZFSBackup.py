@@ -804,9 +804,11 @@ class ZFSBackupDirectory(ZFSBackup):
         The snapshots are in the mapfile.
         First key we care about is the source dataset.
         """
-        map = self.mapfile
-        if self.source in map:
-            return map[self.source]
+        m = self.mapfile
+        if debug:
+            print("mapfile = {}".format(m), file=sys.stderr)
+        if self.source in m:
+            return m[self.source]["snapshots"]
         else:
             return []
 
@@ -838,6 +840,8 @@ class ZFSBackupDirectory(ZFSBackup):
                         break
                     chunk.write(buf)
                     total += len(buf)
+                if debug:
+                    print("Finished writing chunk file {}".format(chunk.name), file=sys.stderr)
         return chunks
     
     def backup_handler(self, stream, **kwargs):
@@ -876,7 +880,7 @@ class ZFSBackupDirectory(ZFSBackup):
         # Now we need to start writing chunks, keeping track of their names.
         with tempfile.TemporaryFile() as error_output:
             fobj = self._filter_backup(stream, error=error_output)
-            chunks = self._write_chunks(stream)
+            chunks = self._write_chunks(fobj)
             if not chunks:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read())
@@ -1479,7 +1483,6 @@ def main():
     try:
         (dataset, snapname) = args.snapshot_name.split('@')
     except ValueError:
-        print("Invalid snapshot name {}".format(args.snapshot_name), file=sys.stderr)
         dataset = args.snapshot_name
         snapname = None
         
