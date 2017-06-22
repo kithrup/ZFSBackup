@@ -299,15 +299,20 @@ class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
     """
     def __init__(self, pigz=False):
         if pigz:
+            self.pigz = True
             backup_command = "/usr/local/bin/pigz"
             restore_command = "/usr/local/bin/unpigz"
         else:
+            self.pigz = False
             backup_command = "/usr/bin/gzip"
             restore_command = "/usr/bin/gunzip"
             
         super(ZFSBackupFilterCompressed, self).__init__(backup_command=[backup_command],
                                                         restore_command=[restore_command])
-            
+    @property
+    def name(self):
+        return "pigz compress filter" if self.pigz else "gzip compress filter"
+    
 class ZFSBackupFilterCounter(ZFSBackupFilterThread):
     """
     A sample thread filter.  All this does is count the
@@ -869,7 +874,12 @@ class ZFSBackupDirectory(ZFSBackup):
                 filters.append(f.restore_command)
                 
         # Now we need to start writing chunks, keeping track of their names.
-        chunks = self._write_chunks(stream)
+        with tempfile.TemporaryFile() as error_output:
+            fobj = self._filter_backup(stream, error=error_output)
+            chunks = self._write_chunks(stream)
+            if not chunks:
+                error_output.seek(0)
+                raise ZFSBackupError(error_output.read())
 
         # Now we need to update the map to have the chunks.
         snapshot_dict = {
@@ -1128,16 +1138,27 @@ class ZFSBackupS3(ZFSBackupDirectory):
             while total < 4*gByte:
                 buf = stream.read(10*mByte)
                 if not buf:
+                    if debug:
+                        print("Breaking out of loop after {} bytes".format(total), file=sys.stderr)
                     done = True
                     break
                 # We need to upload this 10Mbyte part somehow
                 upload_part = uploader.Part(len(parts))
                 response = upload_part.upload(Body=buf)
+                if debug:
+                    print("response = {}".format(response), file=sys.stderr)
                 parts.append({ "ETag" : response["ETag"], "PartNumber" : len(parts) })
                 total += len(buf)
             if parts:
+                if debug:
+                    print("After {} parts, completing upload".format(len(parts)), file=sys.stderr)
                 uploader.complete(MultipartUpload={ "Parts" : parts })
                 chunks.append(chunk_key)
+            if debug:
+                print("Wrote {} bytes to chunk {}".format(total, chunk_key), file=sys.stderr)
+            total = 0
+        if debug:
+            print("Wrote out {} chunks".format(len(chunks)), file=sys.stderr)
         return chunks
     
     def validate(self):
