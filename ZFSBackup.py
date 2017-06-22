@@ -1177,7 +1177,6 @@ class ZFSBackupS3(ZFSBackupDirectory):
         """
         return boto3.session.Session().get_available_regions('s3')
     
->>>>>>> Backup-AWS
 class ZFSBackupSSH(ZFSBackup):
     """
     Replicate to a remote host using ssh.
