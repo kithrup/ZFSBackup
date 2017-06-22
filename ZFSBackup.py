@@ -1,10 +1,16 @@
 from __future__ import print_function
 import os, sys
+import json
 import subprocess
 import time
 import tempfile
 import threading
-
+import StringIO
+import errno
+import boto3
+import botocore
+import socket
+        
 debug = True
 
 def _merge_snapshots(list1, list2):
@@ -292,15 +298,20 @@ class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
     """
     def __init__(self, pigz=False):
         if pigz:
+            self.pigz = True
             backup_command = "/usr/local/bin/pigz"
             restore_command = "/usr/local/bin/unpigz"
         else:
+            self.pigz = False
             backup_command = "/usr/bin/gzip"
             restore_command = "/usr/bin/gunzip"
             
         super(ZFSBackupFilterCompressed, self).__init__(backup_command=[backup_command],
                                                         restore_command=[restore_command])
-            
+    @property
+    def name(self):
+        return "pigz compress filter" if self.pigz else "gzip compress filter"
+    
 class ZFSBackupFilterCounter(ZFSBackupFilterThread):
     """
     A sample thread filter.  All this does is count the
@@ -621,7 +632,7 @@ class ZFSBackup(object):
         command = ["/sbin/zfs", "send"]
         if self.recursive:
             command.append("-R")
-        backup_dict = {}
+        backup_dict = { "Name": last_snapshot["Name"] }
         if last_common_snapshot:
             command.extend(["-I", "{}".format(last_common_snapshot)])
             backup_dict["incremental"] = True
@@ -701,6 +712,472 @@ class ZFSBackup(object):
             snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
         return snapshots
 
+class ZFSBackupDirectory(ZFSBackup):
+    """
+    A variant of ZFSBackup that backs up to files, rather than replication.
+    The layout used is:
+     target/
+      prefix/
+       map.json
+       chunks/
+        data files
+
+    prefix will default to the hostname if none is given.
+    target is the root pathname -- note that this doesn't need to be
+    a ZFS filesystem.
+
+    The map file maps from dataset to snapshots.
+    Since some filesystems (I'm looking at you, msdos) have a
+    limit of 4gb, we'll keep chunks limited to 2gb.
+
+    Each dataset has a chronologically-ordered array of
+    snapshots.
+
+    A snapshot entry in the map contains the name, the
+    creation time, whether it is recursive, and, if it
+    is an incremental snapshot, what the previous one was.
+    It also contains the names of the chunks, and any transformative
+    filter commands (in order to restore it).
+    
+    """
+    def __init__(self, source, target, prefix=None, recursive=False):
+        self._prefix = prefix or socket.gethostname()
+        self._mapfile = None
+        self._chunk_dirname = "chunks"
+        super(ZFSBackupDirectory, self).__init__(source, target, recursive)
+
+
+    def __repr__(self):
+        return "{}({}, {}, prefix={}, recursive={})".format(self.__class__.__name__,
+                                                            self.source, self.target,
+                                                            self.prefix, self.recursive)
+    
+    def validate(self):
+        """
+        Ensure that the destination exists.  Since this is just
+        using files, all we need is os.path.exists
+        """
+        if not os.path.exists(self.target):
+            raise ZFSBackupError("Target {} does not exist".format(self.target))
+        return
+
+    @property
+    def mapfile(self):
+        """
+        Return the mapfile.  If it isn't loaded, we load it now.
+        """
+        if self._mapfile is None:
+            mapfile_path = os.path.join(self.target, self.prefix, "map.json")
+            try:
+                with open(mapfile_path, "r") as mapfile:
+                    self._mapfile = json.load(mapfile)
+            except:
+                # I know, blanket catch, shouldn't do that
+                self._mapfile = {}
+
+        return self._mapfile
+    @mapfile.setter
+    def mapfile(self, d):
+        if debug:
+            print("Setting mapfile to {}".format(d), file=sys.stderr)
+        if not self._mapfile or self._mapfile != d:
+            self._mapfile = d
+            self._save_mapfile()
+            
+    def _save_mapfile(self):
+        """
+        Save the map file.
+        """
+        if self._mapfile:
+            mapfile_path = os.path.join(self.target, self.prefix, "map.json")
+            if debug:
+                print("Saving map file to {}".format(mapfile_path), file=sys.stderr)
+            with open(mapfile_path, "w") as mapfile:
+                json.dump(self._mapfile, mapfile,
+                          sort_keys=True,
+                          indent=4, separators=(',', ': '))
+
+    @property
+    def target_snapshots(self):
+        """
+        The snapshots are in the mapfile.
+        First key we care about is the source dataset.
+        """
+        m = self.mapfile
+        if debug:
+            print("mapfile = {}".format(m), file=sys.stderr)
+        if self.source in m:
+            return m[self.source]["snapshots"]
+        else:
+            return []
+
+    def _write_chunks(self, stream):
+        chunks = []
+        mByte = 1024 * 1024
+        gByte = 1024 * mByte
+        done = False
+
+        base_path = os.path.join(self.target, self.prefix)
+        chunk_dir = os.path.join(base_path, self._chunk_dirname)
+        for d in (base_path, chunk_dir):
+            try:
+                os.makedirs(d)
+            except OSError as e:
+                if e.errno != errno.EEXIST:
+                    raise
+
+        while not done:
+            with tempfile.NamedTemporaryFile(dir=chunk_dir, delete=False) as chunk:
+                chunks.append(os.path.join(self.prefix,
+                                           self._chunk_dirname,
+                                           os.path.basename(chunk.name)))
+                total = 0
+                while total < 2*gByte:
+                    buf = stream.read(mByte)
+                    if not buf:
+                        done = True
+                        break
+                    chunk.write(buf)
+                    total += len(buf)
+                if debug:
+                    print("Finished writing chunk file {}".format(chunk.name), file=sys.stderr)
+        return chunks
+    
+    def backup_handler(self, stream, **kwargs):
+        # Write the backup to the target.  In our case, we're
+        # doing a couple of things:
+        # First, we need to make sure the full target directory
+        # exists -- create it if necessary.
+
+        # Sanity check: unlike the base class, we need to
+        # know the name of the snapshot, and whether it's incremental.
+        # If it is, we also need to know the previous one
+
+        snapshot_name = kwargs.get("Name", None)
+        incremental = kwargs.get("incremental", None)
+        parent = kwargs.get("parent", None)
+
+        if snapshot_name is None:
+            raise ZFSBackupError("Missing name of snapshot")
+
+        if incremental is None:
+            raise ZFSBackupError("Missing incremental information about snapshot")
+
+        # Next sanity check: if this snapshot is already in the map, abort
+        source_map = self.mapfile.get(self.source, {})
+        current_snapshots = source_map.get("snapshots", [])
+        
+        for x in current_snapshots:
+            if x["Name"] == snapshot_name:
+                raise ZFSBackupError("Snapshot {} is already present in target".format(snapshot_name))
+        
+        filters = []
+        for f in reversed(self._filters):
+            if f.transformative and f.restore_command:
+                filters.append(f.restore_command)
+                
+        # Now we need to start writing chunks, keeping track of their names.
+        with tempfile.TemporaryFile() as error_output:
+            fobj = self._filter_backup(stream, error=error_output)
+            chunks = self._write_chunks(fobj)
+            if not chunks:
+                error_output.seek(0)
+                raise ZFSBackupError(error_output.read())
+
+        # Now we need to update the map to have the chunks.
+        snapshot_dict = {
+            "Name" : snapshot_name,
+            "CreationTime" : kwargs.get("CreationTime", int(time.time())),
+            "incremental": incremental,
+            "chunks" : chunks
+        }
+        if incremental:
+            snapshot_dict["parent"] = parent
+        if filters:
+            snapshot_dict["filters"] = filters
+            
+        current_snapshots.append(snapshot_dict)
+        source_map["snapshots"] = current_snapshots
+        self.mapfile[self.source] = source_map
+        self._save_mapfile()
+        
+                    
+    @property
+    def prefix(self):
+        return self._prefix
+    
+class ZFSBackupS3(ZFSBackupDirectory):
+    """
+    Backup to AWS.  Optionally with transitions to glacier.
+    The layout used is:
+     bucket/
+      prefix/
+       map.json
+       glacier/
+        data files
+
+    The map file maps from dataset to snapshots.
+    A glacier file is limited to 40tb (and S3 to 5tb),
+    so we'll actually break the snapshots into 1gbyte
+    chunks.
+
+    We control a lifecycle rule for bucket, which we
+    will name "${prefix} ZFS Backup Rule"; if glacier
+    is enabled, we add that rule, and set glacier migration
+    for "${prefix}/glacier/" for 0 days; if it is not
+    enabled, then we set the rule to be disabled.  (But
+    we always have the rule there.)
+
+    Each dataset has a chronologically-ordered array of
+    snapshots.
+
+    A snapshot entry in the map contains the name, the
+    creation time, whether it is recursive, and, if it
+    is an incremental snapshot, what the previous one was.
+    It also contains the names of the chunks.
+
+    So it looks something like:
+
+    "tank" : [
+	"auto-daily-2017-01-01:00:00" : {
+	    "CreationTime" : 12345678,
+            "Size"         : 1024000,
+            "Recursive"    : True,
+            "Incremental"  : null,
+	    "Chunks"       : [
+		"glacier/${random}",
+		"glacier/${random}"
+	    ]
+         },
+	"auto-daily-2017-01-02:00:00" : {
+	...
+	}
+    ]
+
+    Each dataset being backed up has an entry in the map file.
+    """
+    
+    def __init__(self, source,
+                 bucket, s3_key, s3_secret,
+                 recursive=False, server=None,
+                 prefix=None, region=None, glacier=True):
+        """
+        Backing up to S3 requires a key, secret, and bucket.
+        If prefix is none, it will use the current hostname.
+        (As a result, prefix must be unique within the bucket.)
+
+        If the bucket doesn't exist, it gets created; if
+        glacier is True, then it will set up a transition rule.
+
+        Note that bucket names need to be globally unique.
+        """
+        self._map = None
+        self._glacier = glacier
+
+        self._s3 = boto3.resource('s3', aws_access_key_id=s3_key,
+                                  aws_secret_access_key=s3_secret,
+                                  endpoint_url=server,
+                                  region_name=region)
+
+        self._chunk_dirname = "glacier"
+        # Note that this may not exist.
+        self.bucket = self._s3.Bucket(bucket.lower())
+        self._prefix = prefix or socket.gethostname()
+        # We'll over-load prefix here
+        super(ZFSBackupS3, self).__init__(source, "",
+                                          prefix=prefix,
+                                          recursive=recursive)
+        self._setup_bucket()
+        
+    def validate(self):
+        if debug:
+            print("* * * HERE I AM NOW * * *\n\n", file=sys.stderr)
+        if debug:
+            print("\nRunning setup_bucket\n")
+        return
+    
+    def __repr__(self):
+        return "{}({}, {}, <ID>, <SECRET>, recursive={}, server={}, prefix={}, region={}, glacier={}".format(
+            self.__class__.__name__, self.source, self.bucket.name, self.recursive, self.server,
+            self.prefix, self.region, self.glacier)
+
+    def _setup_bucket(self):
+        """
+        Create a bucket, if necessary.  Also, set up the lifecycle rule
+        depending on whether or not we're using glacier.
+        """
+        if debug:
+            print("Trying to setup bucket {}".format(self.bucket.name), file=sys.stderr)
+            
+        try:
+            self.s3.meta.client.head_bucket(Bucket=self.bucket.name)
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]['Code'] == '404':
+                # Need to create the bucket
+                if debug:
+                    print("Creating bucket {}".format(self.bucket.name))
+                self.bucket = self._s3.create_bucket(Bucket=self.bucket.name)
+            else:
+                raise
+        # Great, now we have a bucket for sure, or have exceptioned out.
+        # Now we want to get the lifecycle rules.
+        lifecycle = self.bucket.Lifecycle()
+        if lifecycle:
+            rule_id = "{} ZFS Backup Rule".format(self.prefix)
+            rule_indx = None
+            try:
+                rules = lifecycle.rules
+            except botocore.exceptions.ClientError as e:
+                if e.response['Error']['Code'] == "NotImplemented":
+                    pass
+                else:
+                    raise
+            else:
+                if not rules:
+                    rules = []
+                for indx, rule in enumerate(lifecycle.rules):
+                    if rule["ID"] == rule_id:
+                        rule_indx = indx
+                        break
+                if rule_indx is None:
+                    # We need to add it
+                    new_rule = {
+                        "ID" : rule_id,
+                        "Filter" : {
+                            "Prefix" : "{}/glacier/".format(self.prefix)
+                        },
+                        "Status" : "Enabled",
+                        "Transitions" : [
+                            {
+                                "Days" : 0,
+                                "StorageClass" : "GLACIER"
+                            }
+                        ]
+                    }
+                    rule_indx = len(rules)
+                    rules.append(new_rule)
+                    changed = True
+                else:
+                    if (self.glacier == ( rules[rule_indx]["Status"] == "Enabled")):
+                        changed = False
+                rules[rule_indx]["Status"] = "Enabled" if self.glacier else "Disabled"
+                if changed:
+                    s3.put_bucket_lifecycle_configuration(Bucket=self.bucket.name,
+                                                          LifecycleConfiguration={ 'Rules' : rules })
+        return
+        
+    @property
+    def glacier(self):
+        return self._glacier
+    @property
+    def prefix(self):
+        return self._prefix
+    @property
+    def s3(self):
+        return self._s3
+
+    @property
+    def bucket(self):
+        return self._bucket
+    @bucket.setter
+    def bucket(self, b):
+        self._bucket = b
+        
+    def _key_exists(self, keyname):
+        try:
+            self.s3.Object(self.bucket.name, keyname).load()
+            return True
+        except:
+            return False
+                
+    @property
+    def mapfile(self):
+        """
+        Load the map file from the bucket.  We cache it so we
+        don't keep reloading it.
+        """
+        if self._mapfile is None:
+            # Check to see if the map file exists in the bucket
+            map_key = "{}/map.json".format(self.prefix)
+            if self._key_exists(map_key):
+                map_file = StringIO.StringIO()
+                self.bucket.download_fileobj(map_key, map_file)
+                map_file.seek(0)
+                self._mapfile = json.load(map_file)
+            else:
+                self._mapfile = {}
+        return self._mapfile
+    @mapfile.setter
+    def mapfile(self, mf):
+        self._mapfile = mf
+
+    def _save_mapfile(self):
+        if self._mapfile:
+            map_key = "{}/map.json".format(self.prefix)
+            map_file = StringIO.StringIO()
+            json.dump(self._mapfile, map_file)
+            map_file.seek(0)
+            self.bucket.upload_fileobj(map_file, map_key)
+            
+    def _write_chunks(self, stream):
+        import binascii
+        
+        chunks = []
+        mByte = 1024 * 1024
+        gByte = 1024 * mByte
+        done = False
+
+        chunk_dir = os.path.join(self.prefix, self._chunk_dirname)
+
+        while not done:
+            while True:
+                chunk_key = os.path.join(chunk_dir, binascii.b2a_hex(os.urandom(32)))
+                if not self._key_exists(chunk_key):
+                    break
+            total = 0
+            obj = self.s3.Object(self.bucket.name, chunk_key)
+            uploader = obj.initiate_multipart_upload(ACL='private')
+            parts = []
+            while total < 4*gByte:
+                buf = stream.read(10*mByte)
+                if not buf:
+                    if debug:
+                        print("Breaking out of loop after {} bytes".format(total), file=sys.stderr)
+                    done = True
+                    break
+                # We need to upload this 10Mbyte part somehow
+                upload_part = uploader.Part(len(parts))
+                response = upload_part.upload(Body=buf)
+                if debug:
+                    print("response = {}".format(response), file=sys.stderr)
+                parts.append({ "ETag" : response["ETag"], "PartNumber" : len(parts) })
+                total += len(buf)
+            if parts:
+                if debug:
+                    print("After {} parts, completing upload".format(len(parts)), file=sys.stderr)
+                uploader.complete(MultipartUpload={ "Parts" : parts })
+                chunks.append(chunk_key)
+            if debug:
+                print("Wrote {} bytes to chunk {}".format(total, chunk_key), file=sys.stderr)
+            total = 0
+        if debug:
+            print("Wrote out {} chunks".format(len(chunks)), file=sys.stderr)
+        return chunks
+    
+    def validate(self):
+        """
+        We don't do a lot of validation, since s3 costs per usage.
+        We'll lazily check the bucket, and create it if necessary.
+        """
+        return
+    
+    def AvailableRegions():
+        """
+        List the available regons.
+        """
+        return boto3.session.Session().get_available_regions('s3')
+    
+>>>>>>> Backup-AWS
 class ZFSBackupSSH(ZFSBackup):
     """
     Replicate to a remote host using ssh.
@@ -930,10 +1407,15 @@ def main():
                         type=bool,
                         default=False,
                         help='Recursively replicate')
-    parser.add_argument('--snapshot', '-S', dest='snapshot_name',
-                        default=None,
-                        help='Snapshot to replicate')
-
+    group = parser.add_mutually_exclusive_group(required=True)
+    
+    group.add_argument('--snapshot', '-S', dest='snapshot_name',
+                       default=None,
+                       help='Snapshot to backup')
+    group.add_argument('--dataset', '--pool', dest='snapshot_name',
+                       default=None,
+                       help='Dataset or pool to back up')
+    
     parser.add_argument("--compressed", "-C", dest='compressed',
                         action='store_true', default=False,
                         help='Compress snapshots')
@@ -967,6 +1449,31 @@ def main():
     ssh_parser.add_argument("--user", '-U', dest='remote_user',
                             help='Remote user (defaults to current user)')
     
+    # Directory parser has only two options
+    directory_parser = subparsers.add_parser("directory",
+                                        help='Save snapshots to a directory')
+    directory_parser.add_argument("--dest", "-D", dest='destination', required=True,
+                                  help='Path to store snapshots')
+    directory_parser.add_argument("--prefix", "-P", dest='prefix', default=None,
+                                  help='Prefix to use when saving snapshots (defaults to hostname)')
+    
+    # S3 parser has many options
+    s3_parser = subparsers.add_parser("s3", help="Save snapshots to an S3 server")
+    s3_parser.add_argument("--bucket", dest='bucket_name', required=True,
+                           help='Name of bucket in which to save data')
+    s3_parser.add_argument("--prefix", dest='prefix', default=None,
+                           help='Prefix (inside of bucket); defaults to host name)')
+    s3_parser.add_argument("--key", "--s3-id", dest='s3_key', required=True,
+                           help='S3 Access ID')
+    s3_parser.add_argument("--secret", dest='s3_secret', required=True,
+                           help='S3 Secret Key')
+    s3_parser.add_argument('--server', dest="s3_server", default=None,
+                           help='S3-compatible server')
+    s3_parser.add_argument('--glacer', dest='glacier', default=True,
+                           type=bool, help='Use Glacier transitioning')
+    s3_parser.add_argument('--region', dest='region', default=None,
+                           help='S3 Region to use')
+    
     args = parser.parse_args()
     debug = args.debug
 
@@ -976,7 +1483,6 @@ def main():
     try:
         (dataset, snapname) = args.snapshot_name.split('@')
     except ValueError:
-        print("Invalid snapshot name {}".format(args.snapshot_name), file=sys.stderr)
         dataset = args.snapshot_name
         snapname = None
         
@@ -991,6 +1497,13 @@ def main():
         backup = ZFSBackupSSH(dataset, args.destination, args.remote_host,
                               remote_user=args.remote_user,
                               recursive=args.recursive)
+    elif args.subcommand == 'directory':
+        backup = ZFSBackupDirectory(dataset, args.destination, recursive=args.recursive,
+                                    prefix=args.prefix)
+    elif args.subcommand == 's3':
+        backup = ZFSBackupS3(dataset, args.bucket_name, args.s3_key, args.s3_secret,
+                             recursive=args.recursive, server=args.s3_server,
+                             prefix=args.prefix, region=args.region, glacier=args.glacier)
     else:
         print("Unknown replicator {}".format(args.subcommand), file=sys.stderr)
         sys.exit(1)
