@@ -979,7 +979,6 @@ class ZFSBackupS3(ZFSBackupDirectory):
                                   endpoint_url=server,
                                   region_name=region)
 
-        self._chunk_dirname = "glacier"
         # Note that this may not exist.
         self.bucket = self._s3.Bucket(bucket.lower())
         self._prefix = prefix or socket.gethostname()
@@ -987,6 +986,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
         super(ZFSBackupS3, self).__init__(source, "",
                                           prefix=prefix,
                                           recursive=recursive)
+        self._chunk_dirname = "glacier"
         self._setup_bucket()
         
     def validate(self):
@@ -1025,45 +1025,52 @@ class ZFSBackupS3(ZFSBackupDirectory):
         if lifecycle:
             rule_id = "{} ZFS Backup Rule".format(self.prefix)
             rule_indx = None
+            changed = False
             try:
                 rules = lifecycle.rules
             except botocore.exceptions.ClientError as e:
                 if e.response['Error']['Code'] == "NotImplemented":
-                    pass
+                    rules = None
+                elif e.response['Error']['Code'] == "NoSuchLifecycleConfiguration":
+                    rules = []
                 else:
                     raise
-            else:
-                if not rules:
-                    rules = []
-                for indx, rule in enumerate(lifecycle.rules):
+            if rules is not None:
+                if debug:
+                    print("Trying to add/set lifecycle rule", file=sys.stderr)
+                for indx, rule in enumerate(rules):
                     if rule["ID"] == rule_id:
                         rule_indx = indx
                         break
+                if debug:
+                    print("rule_indx = {}, appropriate rule = {}".format(rule_indx,
+                                                                         rules[rule_indx] if rule_indx is not None else "<no rules>"), file=sys.stderr)
                 if rule_indx is None:
                     # We need to add it
                     new_rule = {
                         "ID" : rule_id,
-                        "Filter" : {
-                            "Prefix" : "{}/glacier/".format(self.prefix)
-                        },
+                        "Prefix" : "{}/glacier/".format(self.prefix),
                         "Status" : "Enabled",
-                        "Transitions" : [
-                            {
-                                "Days" : 0,
-                                "StorageClass" : "GLACIER"
-                            }
-                        ]
+                        "Transition" : {
+                            "Days" : 1,
+                            "StorageClass" : "GLACIER"
+                        }
                     }
                     rule_indx = len(rules)
                     rules.append(new_rule)
                     changed = True
+                    if debug:
+                        print("rule_indx = {}, rules = {}".format(rule_indx, rules), file=sys.stderr)
                 else:
                     if (self.glacier == ( rules[rule_indx]["Status"] == "Enabled")):
                         changed = False
+                if debug:
+                    print("rule_indx = {}, changed = {}, rules = {}, now let's set it to enabled".format(rule_indx, changed, rules), file=sys.stderr)
                 rules[rule_indx]["Status"] = "Enabled" if self.glacier else "Disabled"
                 if changed:
-                    s3.put_bucket_lifecycle_configuration(Bucket=self.bucket.name,
-                                                          LifecycleConfiguration={ 'Rules' : rules })
+                    if debug:
+                        print("rules = {}".format(rules), file=sys.stderr)
+                    lifecycle.put(LifecycleConfiguration={ 'Rules' : rules })
         return
         
     @property
@@ -1139,6 +1146,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
             uploader = obj.initiate_multipart_upload(ACL='private')
             parts = []
             while total < 4*gByte:
+                part_num = len(parts) + 1
                 buf = stream.read(10*mByte)
                 if not buf:
                     if debug:
@@ -1146,11 +1154,11 @@ class ZFSBackupS3(ZFSBackupDirectory):
                     done = True
                     break
                 # We need to upload this 10Mbyte part somehow
-                upload_part = uploader.Part(len(parts))
+                upload_part = uploader.Part(part_num)
                 response = upload_part.upload(Body=buf)
                 if debug:
                     print("response = {}".format(response), file=sys.stderr)
-                parts.append({ "ETag" : response["ETag"], "PartNumber" : len(parts) })
+                parts.append({ "ETag" : response["ETag"], "PartNumber" : part_num })
                 total += len(buf)
             if parts:
                 if debug:
