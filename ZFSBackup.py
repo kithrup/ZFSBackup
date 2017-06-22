@@ -1051,10 +1051,12 @@ class ZFSBackupS3(ZFSBackupDirectory):
                         "ID" : rule_id,
                         "Prefix" : "{}/glacier/".format(self.prefix),
                         "Status" : "Enabled",
-                        "Transition" : {
-                            "Days" : 1,
-                            "StorageClass" : "GLACIER"
-                        }
+                        "Transitions" : [
+                            {
+                                "Days" : 1,
+                                "StorageClass" : "GLACIER"
+                            },
+                        ],
                     }
                     rule_indx = len(rules)
                     rules.append(new_rule)
@@ -1070,7 +1072,10 @@ class ZFSBackupS3(ZFSBackupDirectory):
                 if changed:
                     if debug:
                         print("rules = {}".format(rules), file=sys.stderr)
-                    lifecycle.put(LifecycleConfiguration={ 'Rules' : rules })
+                    self.s3.meta.client.put_bucket_lifecycle_configuration(
+                        Bucket=self.bucket.name,
+                        LifecycleConfiguration={ 'Rules' : rules }
+                    )
         return
         
     @property
