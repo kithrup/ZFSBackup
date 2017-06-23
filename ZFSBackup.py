@@ -1153,26 +1153,30 @@ class ZFSBackupS3(ZFSBackupDirectory):
             obj = self.s3.Object(self.bucket.name, chunk_key)
             uploader = obj.initiate_multipart_upload(ACL='private')
             parts = []
-            while total < 4*gByte:
-                part_num = len(parts) + 1
-                buf = stream.read(10*mByte)
-                if not buf:
+            try:
+                while total < 4*gByte:
+                    part_num = len(parts) + 1
+                    buf = stream.read(10*mByte)
+                    if not buf:
+                        if debug:
+                            print("Breaking out of loop after {} bytes".format(total), file=sys.stderr)
+                        done = True
+                        break
+                    # We need to upload this 10Mbyte part somehow
+                    upload_part = uploader.Part(part_num)
+                    response = upload_part.upload(Body=buf)
                     if debug:
-                        print("Breaking out of loop after {} bytes".format(total), file=sys.stderr)
-                    done = True
-                    break
-                # We need to upload this 10Mbyte part somehow
-                upload_part = uploader.Part(part_num)
-                response = upload_part.upload(Body=buf)
-                if debug:
-                    print("response = {}".format(response), file=sys.stderr)
-                parts.append({ "ETag" : response["ETag"], "PartNumber" : part_num })
-                total += len(buf)
-            if parts:
-                if debug:
-                    print("After {} parts, completing upload".format(len(parts)), file=sys.stderr)
-                uploader.complete(MultipartUpload={ "Parts" : parts })
-                chunks.append(chunk_key)
+                        print("response = {}".format(response), file=sys.stderr)
+                    parts.append({ "ETag" : response["ETag"], "PartNumber" : part_num })
+                    total += len(buf)
+                if parts:
+                    if debug:
+                        print("After {} parts, completing upload".format(len(parts)), file=sys.stderr)
+                    uploader.complete(MultipartUpload={ "Parts" : parts })
+            except:
+                uploader.abort()
+                raise    
+            chunks.append(chunk_key)
             if debug:
                 print("Wrote {} bytes to chunk {}".format(total, chunk_key), file=sys.stderr)
             total = 0
