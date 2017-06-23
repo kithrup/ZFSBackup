@@ -914,18 +914,18 @@ class ZFSBackupS3(ZFSBackupDirectory):
      bucket/
       prefix/
        map.json
-       glacier/
+      glacier/
         data files
 
     The map file maps from dataset to snapshots.
     A glacier file is limited to 40tb (and S3 to 5tb),
-    so we'll actually break the snapshots into 1gbyte
+    so we'll actually break the snapshots into 4gbyte
     chunks.
 
     We control a lifecycle rule for bucket, which we
     will name "${prefix} ZFS Backup Rule"; if glacier
     is enabled, we add that rule, and set glacier migration
-    for "${prefix}/glacier/" for 0 days; if it is not
+    for "glacier/" for 1 days; if it is not
     enabled, then we set the rule to be disabled.  (But
     we always have the rule there.)
 
@@ -1050,7 +1050,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
                     # We need to add it
                     new_rule = {
                         "ID" : rule_id,
-                        "Prefix" : "{}/glacier/".format(self.prefix),
+                        "Prefix" : "glacier/".format(self.prefix),
                         "Status" : "Enabled",
                         "Transitions" : [
                             {
@@ -1142,7 +1142,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
         gByte = 1024 * mByte
         done = False
 
-        chunk_dir = os.path.join(self.prefix, self._chunk_dirname)
+        chunk_dir = os.path.join(self._chunk_dirname, self.prefix)
 
         while not done:
             while True:
