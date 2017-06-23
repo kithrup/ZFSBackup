@@ -49,6 +49,104 @@ backing up, and one for restoring.  As an example:
 
     filter = ZFSBackupFilterCommand(backup_command=["/bin/cat"])
 
+## Command-line Usage
+
+In general, you need root access to run zfs send.
+
+The layout for the command-line is
+
+    ZFSBackup [common-options] method [method-options]
+    
+### Common command-line options
+
+* --dataset/--pool or --snapshot
+
+  This specifies which dataset/pool.  One of these options is required.  Currently they are all treated the same.
+* --debug
+* --verbose
+* --operation backup|list
+
+  This specifies the operation to perform; the default is backup.
+* --compressed, -C
+
+  Compress the backup.  The default is to use gzip, but with --pigz, it will use /usr/local/bin/pigz to compress.  This is performed using the ZFSBackupFilterCompressed filter.
+* --recursive, -R
+
+  Recursively perform the operation.  Currently only valid with backup.
+
+### ZFS replication options
+The 'zfs' method replicates from one ZFS pool/dataset to another ZFS dataset.  There is only one, mandatory option:
+
+* --dest, -D
+
+  Specify the destination dataset.
+
+### Directory backup options
+The "directory" method saves snapshots as files in the given directory.  It breaks the snapshot down into
+multiple chunks, with a maximum size of 2GBytes.  It maintains a map file, which is a JSON file with the
+source dataset as the primary key, and then information about each snapshot for the source.
+
+The options for the "directory" method are:
+
+* --dest, -D
+
+  The destination directory.  This is required.
+* --prefix, -P
+
+  A prefix to use.  By default, it will use the hostname.
+
+Backups are thus stored in DEST/PREFIX/chunks/SNAPSHOTCHUNKFILE
+
+### S3 backup options
+The "s3" method is similar to the "directory" method, but it uses an Amazon S3-compatible
+server (it has been tested with Amazon's S3, and with the Minio server).
+It uses a largr chunk size (4GBytes), but otherwise behaves the same as the "directory"
+method.
+
+The "s3" options are:
+
+* --bucket
+
+  The name of the bucket to use.  S3 bucket names must be globally unique on the server.
+* --prefix
+
+  A prefix to use in the bucket.  This defaults to the hostname.
+* --key
+
+  The access key used to access the service.  The key must be able to list, create, and
+set lifecycle configuration on buckets, as well as list, create, and delete files within
+the bucket.  The access key is required.
+* --secret
+
+  The secret associated with the given key.  This is required.
+* --server
+
+  The URL for an S3-compatible server.  The default is to use Amazon.
+* --glacier
+
+  A boolean ("yes", "true", "1", "t", "y" for yes) indicating whether or
+not to migrate chunk files to Glacier after 1 day.  The default is true.
+* --region
+
+  The region to use.
+
+### SSH Backup
+The 'ssh' method replicates the pool/dataset to a remote ZFS dataset, using
+ssh.  The options are:
+
+* --dest, -D
+
+  The target dataset to backup to.  This option is required.
+* --host, -H
+
+  The remote host to backup to.  This option is required.
+* --user, -U
+
+  The username to use.  Default is to use the current user.
+
+It is strongly recommended that password-less login be set up using
+public and private keys.
+
 ## Limitations
 
 * Restore is not yet implemented.
