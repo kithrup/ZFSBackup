@@ -12,6 +12,7 @@ import botocore
 import socket
         
 debug = True
+verbose = False
 
 def _merge_snapshots(list1, list2):
     """
@@ -1117,6 +1118,8 @@ class ZFSBackupS3(ZFSBackupDirectory):
                 map_file.seek(0)
                 self._mapfile = json.load(map_file)
             else:
+                if debug:
+                    print("mapfile {} does not exist in bucket".format(map_key), file=sys.stderr)
                 self._mapfile = {}
         return self._mapfile
     @mapfile.setter
@@ -1399,7 +1402,7 @@ class ZFSBackupCount(ZFSBackup):
         return self._count
     
 def main():
-    global debug
+    global debug, verbose
     import argparse
 
     def to_bool(s):
@@ -1410,6 +1413,11 @@ def main():
     parser = argparse.ArgumentParser(description='ZFS snapshot replictor')
     parser.register('type', 'bool', to_bool)
     
+    parser.add_argument("--operation", dest='operation',
+                        default='backup',
+                        choices=["backup", "restore",
+                                 "list", "verify",
+                                 "delete"])
     parser.add_argument("--debug", dest='debug',
                         action='store_true', default=False,
                         help='Turn on debugging')
@@ -1487,8 +1495,11 @@ def main():
                            help='S3 Region to use')
     
     args = parser.parse_args()
+    verbose = args.verbose
     debug = args.debug
-
+    if debug:
+        verbose = True
+        
     if debug:
         print("args = {}".format(args), file=sys.stderr)
     
@@ -1523,12 +1534,19 @@ def main():
     if args.compressed:
         backup.AddFilter(ZFSBackupFilterCompressed(pigz=args.use_pigz))
             
-    if args.verbose:
-        print("Starting backup of {}".format(dataset))
-    backup.backup(snapname=snapname)
-    if args.verbose:
-        print("Done with backup");
-
+    if args.operation == "backup":
+        if verbose:
+            print("Starting backup of {}".format(dataset))
+        backup.backup(snapname=snapname)
+        if args.verbose:
+            print("Done with backup");
+    elif args.operation == "list":
+        # List snapshots
+        if debug:
+            print("Listing snapshots", file=sys.stderr)
+        for snapshot in backup.target_snapshots:
+            print("Snapshot {}@{}".format(dataset, snapshot["Name"]))
+                
     if isinstance(backup, ZFSBackupCount):
         print("{} bytes".format(backup.count))
         
