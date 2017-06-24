@@ -1575,8 +1575,21 @@ def main():
         if debug:
             print("Listing snapshots", file=sys.stderr)
         for snapshot in backup.target_snapshots:
-            print("Snapshot {}@{}".format(dataset, snapshot["Name"]))
-                
+            output = "Snapshot {}@{}".format(dataset, snapshot["Name"])
+            if verbose:
+                ctime = time.localtime(snapshot.get("CreationTime", 0))
+                output += "\n\tCreated {}".format(time.strftime("%a, %d %b %Y %H:%M:%S %z", ctime))
+                if snapshot.get("incremental", False):
+                    output += "\n\tincremental parent={}".format(snapshot.get("parent", "<unknown>"))
+                filters = snapshot.get("filters", [])
+                for filter in filters:
+                    output += "\n\tFilter: {}".format(" ".join(filter))
+                for key in snapshot.keys():
+                    if key in ("Name", "CreationTime", "incremental",
+                               "parent", "chunks", "filters"):
+                        continue
+                    output += "\n\t{} = {}".format(key, snapshot[key])
+            print(output)
     if isinstance(backup, ZFSBackupCount):
         print("{} bytes".format(backup.count))
         
