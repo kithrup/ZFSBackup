@@ -134,6 +134,7 @@ class ZFSBackupFilter(object):
         run gzip.
         """
         return source
+
     def start_restore(self, source):
         """
         Start the filter when doing a restore.
@@ -150,6 +151,10 @@ class ZFSBackupFilterThread(ZFSBackupFilter, threading.Thread):
     be called with a callable object as the "process=" parameter.
     The process method may need to check ZFSBackupFilterThread.mode
     to decide if it is backing up or restoring.
+    
+    Interestingly, this doesn't seem to actually work the way I'd expected:
+    when writing from a thread to a popen'd pipe, the pipe will block, even
+    when a thread closes the write end of the pipe.
     """
     def __init__(self, process=None, name="Thread Filter"):
         super(ZFSBackupFilterThread, self).__init__()
@@ -159,6 +164,7 @@ class ZFSBackupFilterThread(ZFSBackupFilter, threading.Thread):
         self._done = threading.Event()
         self._done.clear()
         self._process = process
+        self.daemon = True
         if self._process is None:
             self._name = "Null Thread Filter"
         else:
@@ -167,7 +173,9 @@ class ZFSBackupFilterThread(ZFSBackupFilter, threading.Thread):
     @property
     def transformative(self):
         return False
-    
+    @transformative.setter
+    def transformative(self, b):
+        pass
     @property
     def backup_command(self):
         return None
@@ -205,27 +213,72 @@ class ZFSBackupFilterThread(ZFSBackupFilter, threading.Thread):
     def run(self):
         while True:
             b = self.source.read(1024*1024)
+            if debug:
+                print("In thread, read {} bytes".format(len(b)), file=sys.stderr)
             if b:
-                os.write(self.output_pipe, self.process(b))
+                temp_buf = self.process(b)
+                self._py_write.write(temp_buf)
+                if debug:
+                    print("In thread, wrote {} bytes".format(len(temp_buf)), file=sys.stderr)
             else:
                 break
+        if debug:
+            print("In thread, closing pipes", file=sys.stderr)
+        self._py_write.close()
         self._done.set()
-        os.close(self.output_pipe)
+        if debug:
+            print("Done with thread", file=sys.stderr)
         
     def start_backup(self, source):
         self._mode = "backup"
         self._source = source
-        self._py_output = os.fdopen(self.input_pipe, "rb")
+        self._py_read = os.fdopen(self.input_pipe, "rb")
+        self._py_write = os.fdopen(self.output_pipe, "wb")
         self.start()
-        return self._py_output
+        if debug:
+            print("In thread start_backup, returning {}".format(self._py_read), file=sys.stderr)
+        return self._py_read
 
     def start_restore(self, source):
         self._mode = "restore"
         self._source = source
-        rv = os.fdopen(self.input_pipe, "rb")
+        rv = os.fdopen(self.input_pipe, "rb", 0)
         self.start()
         return rv
     
+class ZFSBackupFilterCounter(ZFSBackupFilterThread):
+    """
+    A sample thread filter.  All this does is count the
+    bytes that come in to be processed.
+    """
+    def __init__(self, handler=None):
+        super(ZFSBackupFilterCounter, self).__init__()
+        self._count = 0
+        self.handler = handler
+        
+    def name(self):
+        return "ZFS Count Filter"
+
+    def process(self, b):
+        self._count += len(b)
+        return b
+
+    @property
+    def handler(self):
+        return self._handler
+    @handler.setter
+    def handler(self, h):
+        self._handler = h
+
+    @property
+    def count(self):
+        if debug:
+            print("In count, waiting for event", file=sys.stderr)
+        self._done.wait()
+        if self.handler and iscallable(self.handler):
+            self.handler(self._count)
+        return self._count
+
 class ZFSBackupFilterCommand(ZFSBackupFilter):
     """
     Derived class for backup filters based on commands.
@@ -290,6 +343,8 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
                   stderr=self.error,
                   stdin=source,
                   stdout=subprocess.PIPE)
+        if debug:
+            print("In start_bauckup for command, source = {}, p.stdout = {}".format(source, p.stdout), file=sys.stderr)
         return p.stdout
     
 class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
@@ -313,37 +368,6 @@ class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
     def name(self):
         return "pigz compress filter" if self.pigz else "gzip compress filter"
     
-class ZFSBackupFilterCounter(ZFSBackupFilterThread):
-    """
-    A sample thread filter.  All this does is count the
-    bytes that come in to be processed.
-    """
-    def __init__(self, handler=None):
-        super(ZFSBackupFilterCounter, self).__init__()
-        self._count = 0
-        self.handler = handler
-        
-    def name(self):
-        return "ZFS Count Filter"
-
-    def process(self, b):
-        self._count += len(b)
-        return b
-
-    @property
-    def handler(self):
-        return self._handler
-    @handler.setter
-    def handler(self, h):
-        self._handler = h
-
-    @property
-    def count(self):
-        self._done.wait()
-        if self.handler and iscallable(self.handler):
-            self.handler(self._count)
-        return self._count
-
 class ZFSBackup(object):
     """
     Base class for doing ZFS backups.
@@ -1399,6 +1423,7 @@ class ZFSBackupSSH(ZFSBackup):
                 # We'll assume this is because there are no snapshots
                 pass
             return snapshots
+
         
 class ZFSBackupCount(ZFSBackup):
     def __init__(self, source, recursive=False):
@@ -1412,12 +1437,17 @@ class ZFSBackupCount(ZFSBackup):
     def validate(self):
         return
     
+        
     def backup_handler(self, stream, **kwargs):
+        fobj = self._filter_backup(stream)
         count = 0
         mByte = 1024 * 1024
-        fobj = self._filter_backup(stream)
         while True:
+            if debug:
+                print("In count backup_handler, about to read", file=sys.stderr)
             b = fobj.read(mByte)
+            if debug:
+                print("In counter backup_handler, read {} bytes".format(len(b)), file=sys.stderr)
             if b:
                 count += len(b)
             else:
@@ -1562,6 +1592,8 @@ def main():
         sys.exit(1)
 
     if args.compressed:
+        before_count = ZFSBackupFilterCounter()
+        backup.AddFilter(before_count)
         backup.AddFilter(ZFSBackupFilterCompressed(pigz=args.use_pigz))
             
     if args.operation == "backup":
@@ -1591,7 +1623,10 @@ def main():
                     output += "\n\t{} = {}".format(key, snapshot[key])
             print(output)
     if isinstance(backup, ZFSBackupCount):
-        print("{} bytes".format(backup.count))
+        output = "{} bytes".format(backup.count)
+        if args.compressed:
+            output += " ({} uncompressed)".format(before_count.count)
+        print(output)
         
 if __name__ == "__main__":
     main()
