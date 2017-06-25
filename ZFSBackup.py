@@ -160,9 +160,15 @@ class ZFSBackupFilterThread(ZFSBackupFilter, threading.Thread):
     when a thread closes the write end of the pipe.
     """
     def __init__(self, process=None, name="Thread Filter"):
+        import fcntl
         super(ZFSBackupFilterThread, self).__init__()
         threading.Thread.__init__(self)
         (self.input_pipe, self.output_pipe) = os.pipe()
+        # We need to set F_CLOEXEC on the output_pipe, or
+        # a subsequent Popen call will keep a dangling open
+        # reference around.
+        flags = fcntl.fcntl(self.output_pipe, fcntl.F_GETFD)
+        fcntl.fcntl(self.output_pipe, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
         self._source = None
         self._done = threading.Event()
         self._done.clear()
@@ -216,21 +222,13 @@ class ZFSBackupFilterThread(ZFSBackupFilter, threading.Thread):
     def run(self):
         while True:
             b = self.source.read(1024*1024)
-            if debug:
-                print("In thread, read {} bytes".format(len(b)), file=sys.stderr)
             if b:
                 temp_buf = self.process(b)
                 self._py_write.write(temp_buf)
-                if debug:
-                    print("In thread, wrote {} bytes".format(len(temp_buf)), file=sys.stderr)
             else:
                 break
-        if debug:
-            print("In thread, closing pipes", file=sys.stderr)
         self._py_write.close()
         self._done.set()
-        if debug:
-            print("Done with thread", file=sys.stderr)
         
     def start_backup(self, source):
         self._mode = "backup"
@@ -275,8 +273,6 @@ class ZFSBackupFilterCounter(ZFSBackupFilterThread):
 
     @property
     def count(self):
-        if debug:
-            print("In count, waiting for event", file=sys.stderr)
         self._done.wait()
         if self.handler and iscallable(self.handler):
             self.handler(self._count)
@@ -1446,11 +1442,7 @@ class ZFSBackupCount(ZFSBackup):
         count = 0
         mByte = 1024 * 1024
         while True:
-            if debug:
-                print("In count backup_handler, about to read", file=sys.stderr)
             b = fobj.read(mByte)
-            if debug:
-                print("In counter backup_handler, read {} bytes".format(len(b)), file=sys.stderr)
             if b:
                 count += len(b)
             else:
