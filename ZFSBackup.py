@@ -5,7 +5,10 @@ import subprocess
 import time
 import tempfile
 import threading
-import StringIO
+if sys.version_info[0] == 2:
+    from StringIO import StringIO
+else:
+    from io import StringIO
 import errno
 import boto3
 import botocore
