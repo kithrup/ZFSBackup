@@ -1146,7 +1146,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
             # Check to see if the map file exists in the bucket
             map_key = "{}/map.json".format(self.prefix)
             if self._key_exists(map_key):
-                map_file = StringIO.StringIO()
+                map_file = StringIO()
                 self.s3.download_fileobj(Bucket=self.bucket,
                                          Key=map_key,
                                          Fileobj=map_file)
@@ -1164,7 +1164,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
     def _save_mapfile(self):
         if self._mapfile:
             map_key = "{}/map.json".format(self.prefix)
-            map_file = StringIO.StringIO()
+            map_file = StringIO()
             json.dump(self._mapfile, map_file)
             map_file.seek(0)
             self.s3.upload_fileobj(Bucket=self.bucket,
@@ -1586,10 +1586,15 @@ def main():
         print("Unknown replicator {}".format(args.subcommand), file=sys.stderr)
         sys.exit(1)
 
+    before_count = None; after_count = None
     if args.compressed:
-        before_count = ZFSBackupFilterCounter()
-        backup.AddFilter(before_count)
+        if verbose:
+            before_count = ZFSBackupFilterCounter()
+            backup.AddFilter(before_count)
         backup.AddFilter(ZFSBackupFilterCompressed(pigz=args.use_pigz))
+        if verbose:
+            after_count = ZFSBackupFilterCounter()
+            backup.AddFilter(after_count)
             
     if args.operation == "backup":
         if verbose:
@@ -1617,11 +1622,19 @@ def main():
                         continue
                     output += "\n\t{} = {}".format(key, snapshot[key])
             print(output)
-    if isinstance(backup, ZFSBackupCount):
-        output = "{} bytes".format(backup.count)
-        if args.compressed:
-            output += " ({} uncompressed)".format(before_count.count)
-        print(output)
+
+
+    if args.operation in ("backup", "restore"):
+        if isinstance(backup, ZFSBackupCount):
+            output = "{} bytes".format(backup.count)
+            print(output)
+        
+        if before_count and after_count:
+            pct = (after_count.count * 100.0) / before_count.count
+            output = "Compressed {} to {} bytes ({:.2f}%)".format(before_count.count,
+                                                                  after_count.count,
+                                                                  pct)
+            print(output)
         
 if __name__ == "__main__":
     main()
