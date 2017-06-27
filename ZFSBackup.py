@@ -600,7 +600,7 @@ class ZFSBackup(object):
                 raise ZFSBackupError(error_output.read())
         return
 
-    def backup(self, snapname=None, force_full=False):
+    def backup(self, snapname=None, force_full=False, snapshot_handler=None):
         """
         Back up the source to the target.
         If snapname is given, then that will be the snapshot used for the backup,
@@ -705,10 +705,14 @@ class ZFSBackup(object):
                                       stdout=subprocess.PIPE)
                     if debug:
                         print("backup_dict = {}".format(backup_dict), file=sys.stderr)
+                    if callable(snapshot_handler):
+                        snapshot_handler(stage="start", **backup_dict)
                     self.backup_handler(send_proc.stdout, **backup_dict)
                     if send_proc.returncode:
                         error_output.seek(0)
                         raise ZFSBackupError(error_output.read())
+                    if callable(snapshot_handler):
+                        snapshot_handler(stage="complete", **backup_dict)
                 self._finish_filters()
             # Set the last_common_snapshot to make the next iteration an incremental
             last_common_snapshot = snapshot["Name"]
@@ -1599,9 +1603,17 @@ def main():
             backup.AddFilter(after_count)
             
     if args.operation == "backup":
+        def handler(**kwargs):
+            stage = kwargs.get("stage", "")
+            if stage == "start":
+                print("Starting backup of snapshot {}@{}".format(dataset, kwargs.get("Name")))
+            elif stage == "complete":
+                print("Completed backup of snapshot {}@{}".format(dataset, kwargs.get("Name")))
+                
         if verbose:
             print("Starting backup of {}".format(dataset))
-        backup.backup(snapname=snapname)
+            
+        backup.backup(snapname=snapname, snapshot_handler=handler if verbose else None)
         if args.verbose:
             print("Done with backup");
     elif args.operation == "list":
