@@ -676,6 +676,8 @@ class ZFSBackup(object):
         # If we have a last common snapshot, we can do an incremental from it to
         # the last snapshot; if we don't, we'll need to do a full send.
         for snapshot in snapshot_list:
+            if snapshot["Name"] == last_common_snapshot:
+                continue
             command = ["/sbin/zfs", "send"]
             if self.recursive:
                 command.append("-R")
