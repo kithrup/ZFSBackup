@@ -1366,8 +1366,6 @@ class ZFSBackupSSH(ZFSBackup):
     def backup_handler(self, stream, **kwargs):
         """
         Implement the replication.
-        This is not right yet:  we need to decompress and decrypt and dewhatever else
-        and do it by creating a pipeline on the remote end.
         """
 
         # First, we create the intervening dataset pats. See the base class' method.
