@@ -4,6 +4,9 @@ ZFSBackup is a Python module to backup ZFS pools and datasets;
 it's written in an object-oriented fashion to allow for different
 backup methods.
 
+Note that ZFSBackup backs up pools and datasets, _not_ individual
+files.
+
 ## API Reference
 
 The base class is ZFSBackup:
