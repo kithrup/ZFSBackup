@@ -5,10 +5,7 @@ import subprocess
 import time
 import tempfile
 import threading
-if sys.version_info[0] == 2:
-    from StringIO import StringIO
-else:
-    from io import StringIO
+from io import BytesIO
 import errno
 import boto3
 import botocore
@@ -1156,12 +1153,12 @@ class ZFSBackupS3(ZFSBackupDirectory):
             # Check to see if the map file exists in the bucket
             map_key = "{}/map.json".format(self.prefix)
             if self._key_exists(map_key):
-                map_file = StringIO()
+                map_file = BytesIO()
                 self.s3.download_fileobj(Bucket=self.bucket,
                                          Key=map_key,
                                          Fileobj=map_file)
                 map_file.seek(0)
-                self._mapfile = json.load(map_file)
+                self._mapfile = json.loads(map_file.getvalue().decode('utf-8'))
             else:
                 if debug:
                     print("mapfile {} does not exist in bucket".format(map_key), file=sys.stderr)
@@ -1174,8 +1171,8 @@ class ZFSBackupS3(ZFSBackupDirectory):
     def _save_mapfile(self):
         if self._mapfile:
             map_key = "{}/map.json".format(self.prefix)
-            map_file = StringIO()
-            json.dump(self._mapfile, map_file)
+            buffer = json.dumps(self._mapfile).encode('utf-8')
+            map_file = BytesIO(buffer)
             map_file.seek(0)
             self.s3.upload_fileobj(Bucket=self.bucket,
                                    Key=map_key,
@@ -1193,7 +1190,8 @@ class ZFSBackupS3(ZFSBackupDirectory):
 
         while not done:
             while True:
-                chunk_key = os.path.join(chunk_dir, binascii.b2a_hex(os.urandom(32)))
+                chunk_key = binascii.b2a_hex(os.urandom(32)).decode('utf-8')
+                chunk_key = os.path.join(chunk_dir, chunk_key)
                 if not self._key_exists(chunk_key):
                     break
             total = 0
