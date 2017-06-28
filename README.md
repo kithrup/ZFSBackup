@@ -75,7 +75,7 @@ The layout for the command-line is
   Compress the backup.  The default is to use gzip, but with --pigz, it will use /usr/local/bin/pigz to compress.  This is performed using the ZFSBackupFilterCompressed filter.
 * --recursive, -R
 
-  Recursively perform the operation.  Currently only valid with backup.
+  Recursively perform the operation.  Currently only valid with backup.  The default is to not use recursion.
 
 ### ZFS replication options
 The 'zfs' method replicates from one ZFS pool/dataset to another ZFS dataset.  There is only one, mandatory option:
@@ -104,7 +104,9 @@ Backups are thus stored in DEST/PREFIX/chunks/SNAPSHOTCHUNKFILE
 The "s3" method is similar to the "directory" method, but it uses an Amazon S3-compatible
 server (it has been tested with Amazon's S3, and with the Minio server).
 It uses a largr chunk size (4GBytes), but otherwise behaves the same as the "directory"
-method.
+method.  When glacier transition is enabled (the default), it will set up a transition
+rule for the given bucket and prefix that will migrate the chunk objects to glacier storage
+after 1 day.
 
 The "s3" options are:
 
@@ -125,10 +127,9 @@ the bucket.  The access key is required.
 * --server
 
   The URL for an S3-compatible server.  The default is to use Amazon.
-* --glacier
+* --glacier, --no-glacier
 
-  A boolean ("yes", "true", "1", "t", "y" for yes) indicating whether or
-not to migrate chunk files to Glacier after 1 day.  The default is true.
+  Whether or not to use glacier.  The default is to use glacier.
 * --region
 
   The region to use.

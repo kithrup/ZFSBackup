@@ -67,7 +67,7 @@ def _get_snapshots(ds):
     if debug:
         print("get_snapshots: {}".format(" ".join(command)), file=sys.stderr)
     try:
-        output = CHECK_OUTPUT(command).split("\n")
+        output = CHECK_OUTPUT(command).decode('utf-8').split("\n")
     except subprocess.CalledProcessError:
         # We'll assume this is because there are no snapshots
         return []
@@ -1485,7 +1485,7 @@ def main():
     parser.add_argument("--verbose", dest='verbose', action='store_true',
                         default=False, help='Be verbose')
     parser.add_argument('--recursive', '-R', dest='recursive',
-                        type=bool,
+                        action='store_true',
                         default=False,
                         help='Recursively replicate')
     group = parser.add_mutually_exclusive_group(required=True)
@@ -1550,6 +1550,10 @@ def main():
                            help='S3 Secret Key')
     s3_parser.add_argument('--server', dest="s3_server", default=None,
                            help='S3-compatible server')
+    glacier = s3_parser.add_mutually_exclusive_group()
+    glacier.add_argument("--glacier", dest='glacier', action='store_true', default=True)
+    glacier.add_argument("--no-glacier", dest='glacier', action='store_false')
+    
     s3_parser.add_argument('--glacer', dest='glacier', default=True,
                            type=bool, help='Use Glacier transitioning')
     s3_parser.add_argument('--region', dest='region', default=None,
