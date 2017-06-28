@@ -1222,10 +1222,10 @@ class ZFSBackupS3(ZFSBackupDirectory):
                 if parts:
                     if debug:
                         print("After {} parts, completing upload".format(len(parts)), file=sys.stderr)
-                        self.s3.complete_multipart_upload(Bucket=self.bucket,
-                                                          Key=chunk_key,
-                                                          UploadId=upload_id,
-                                                          MultipartUpload={ "Parts" : parts })
+                    self.s3.complete_multipart_upload(Bucket=self.bucket,
+                                                      Key=chunk_key,
+                                                      UploadId=upload_id,
+                                                      MultipartUpload={ "Parts" : parts })
             except:
                 if verbose:
                     print("Aborting multipart upload after {} parts".format(len(parts)), file=sys.stderr)
