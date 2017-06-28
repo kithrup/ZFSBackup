@@ -39,6 +39,7 @@ The classes are
 * ZFSBackupFilterCommand
 * ZFSBackupFilterCompressed
 * ZFSBackupFilterCounter
+* ZFSBackupFilterEncrypted
 
 An example use:
 
@@ -73,6 +74,10 @@ The layout for the command-line is
 * --compressed, -C
 
   Compress the backup.  The default is to use gzip, but with --pigz, it will use /usr/local/bin/pigz to compress.  This is performed using the ZFSBackupFilterCompressed filter.
+* --encrypted, -E
+  Encrypt the backup.  The default is no encryption.  When using encryption, --password-file=/path *must*
+be specified.  Optionally, a cipher may be specified with --cipher=cipher; the default is to use the
+aes-256-cbc cipher.  Valid ciphers are determined by using 'openssl list-cipher-commands'.
 * --recursive, -R
 
   Recursively perform the operation.  Currently only valid with backup.  The default is to not use recursion.

@@ -360,6 +360,50 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
         if self.proc:
             self.proc.wait()
     
+class ZFSBackupFilterEncrypted(ZFSBackupFilterCommand):
+    """
+    A filter to encrypt and decrypt a stream.
+    The openssl command can do a lot more than we're asking
+    of it here.
+    We require a password file (for now, anyway).
+    """
+    def __init__(self, cipher="aes-256-cbc",
+                 password_file=None):
+        def ValidateCipher(cipher):
+            if cipher is None:
+                return False
+            try:
+                ciphers = CHECK_OUTPUT(["/usr/bin/openssl", "list-cipher-commands"]).split()
+                return cipher in ciphers
+            except:
+                return False
+        if password_file is None:
+            raise ValueError("Password file must be set for encryption filter")
+
+        if not ValidateCipher(cipher):
+            raise ValueError("Invalid cipher {}".format(cipher))
+        
+        self.cipher = cipher
+        self.password_file = password_file
+        
+        backup_command = ["/usr/bin/openssl",
+                          "enc", "-{}".format(cipher),
+                          "-e",
+                          "-salt",
+                          "-pass", "file:{}".format(password_file)]
+        restore_command = ["/usr/bin/openssl",
+                           "enc", "-{}".format(cipher),
+                           "-d",
+                           "-salt",
+                           "-pass", "file:{}".format(password_file)]
+
+        super(ZFSBackupFilterEncrypted, self).__init__(backup_command=backup_command,
+                                                     restore_command=restore_command)
+        
+    @property
+    def name(self):
+        return "{} encryption filter".format(self.cipher)
+    
 class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
     """
     A sample command filter, for compressing.
@@ -1495,6 +1539,16 @@ def main():
                        default=None,
                        help='Dataset or pool to back up')
     
+    parser.add_argument("--encrypted", "-E", dest='encrypted',
+                        action='store_true', default=False,
+                        help='Encrypt snapshots')
+    parser.add_argument("--cipher", dest='cipher',
+                        default='aes-256-cbc',
+                        help='Encryption cipher to use')
+    parser.add_argument('--password-file', dest='password_file',
+                        default=None,
+                        help='Password file for encryption')
+    
     parser.add_argument("--compressed", "-C", dest='compressed',
                         action='store_true', default=False,
                         help='Compress snapshots')
@@ -1558,6 +1612,17 @@ def main():
                            help='S3 Region to use')
     
     args = parser.parse_args()
+
+    # Due to the complexity of encryption, we need to handle
+    # some cases that (as far as I can tell) argparse doesn't.
+    if args.encrypted:
+        if args.password_file is None:
+            print("Password file is required when encrypting backups", file=sys.stderr)
+            sys.exit(1)
+        if args.subcommand == "ssh":
+            print("Encrypting while using ssh replication is not possible", file=sys.stderr)
+            sys.exit(1)
+            
     verbose = args.verbose
     debug = args.debug
     if debug:
@@ -1604,6 +1669,11 @@ def main():
             after_count = ZFSBackupFilterCounter()
             backup.AddFilter(after_count)
             
+    if args.encrypted:
+        encrypted_filter = ZFSBackupFilterEncrypted(cipher=args.cipher,
+                                                    password_file=args.password_file)
+        backup.AddFilter(encrypted_filter)
+        
     if args.operation == "backup":
         def handler(**kwargs):
             stage = kwargs.get("stage", "")
