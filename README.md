@@ -75,6 +75,7 @@ The layout for the command-line is
 
   Compress the backup.  The default is to use gzip, but with --pigz, it will use /usr/local/bin/pigz to compress.  This is performed using the ZFSBackupFilterCompressed filter.
 * --encrypted, -E
+
   Encrypt the backup.  The default is no encryption.  When using encryption, --password-file=/path *must*
 be specified.  Optionally, a cipher may be specified with --cipher=cipher; the default is to use the
 aes-256-cbc cipher.  Valid ciphers are determined by using 'openssl list-cipher-commands'.
