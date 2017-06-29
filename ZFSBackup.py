@@ -58,7 +58,7 @@ def _get_snapshots(ds):
     This only works for local ZFS pools, obviously.
     It relies on /sbin/zfs sorting, rather than sorting itself.
     """
-    command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation",
+    command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation,receive_resume_token",
                "-r", "-d", "1", "-t", "snapshot", "-s", "creation",
                ds]
     if debug:
@@ -72,9 +72,12 @@ def _get_snapshots(ds):
     for snapshot in output:
         if not snapshot:
             continue
-        (name, ctime) = snapshot.rstrip().split()
+        (name, ctime, resume_token) = snapshot.rstrip().split()
         name = name.split('@')[1]
-        snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
+        d = { "Name" : name, "CreationTime" : int(ctime) }
+        if resume_token != "-":
+            d["ResumeToken"] = resume_token
+        snapshots.append(d)
     return snapshots
 
 class ZFSBackupError(ValueError):
@@ -771,7 +774,7 @@ class ZFSBackup(object):
         an empty array is returned.
         This would be better with libzfs.
         """
-        command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation",
+        command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation,receive_resume_token",
                    "-r", "-d", "1", "-t", "snapshot", "-s", "creation",
                    self.target]
         try:
@@ -783,8 +786,12 @@ class ZFSBackup(object):
         for snapshot in output:
             if not snapshot:
                 continue
-            (name, ctime) = snapshot.rstrip().split()
-            snapshots.append({"Name" : name, "CreationTime" : int(ctime) })
+            (name, ctime, resume_token) = snapshot.rstrip().split()
+            d = {"Name" : name, "CreationTime" : int(ctime) }
+            if resume_token != "-":
+                d["ResumeToken"] = resume_token
+            snapshots.append(d)
+            
         return snapshots
 
 class ZFSBackupDirectory(ZFSBackup):
