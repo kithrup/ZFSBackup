@@ -6,8 +6,8 @@ AWS connection (via boto):
     * endpoint (boto3 only)
 
 AWS Bucket (via boto)
-    * name
-    * location (defaults to east coast USA)
+    * bucket name
+    * region (defaults to us-east-1) 
     * Data upload must be to STANDARD or STANDARD_IA
     * Data can be migrated based on prefix and after a time period
     * Glacier data takes min. 4 hours to restore
@@ -48,4 +48,3 @@ Notes on ZFS replication
 * Basic replication is zfs send | zfs recv
 * Replication can be recursive
   * If recursive, ensure that destination is not a child of source
-  
