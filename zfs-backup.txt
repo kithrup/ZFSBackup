@@ -16,6 +16,7 @@ ZFS Backup Strategy
 
 HOW TO BACKUP
 
+* All backups require at least one snapshot on source.
 * Normally or force full
 * Normal backup need list of snapshots on source and destination
   * Starting from most recent snapshot, find first snapshot in common.

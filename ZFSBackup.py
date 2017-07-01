@@ -14,6 +14,45 @@ import socket
 debug = True
 verbose = False
 
+def _last_common_snapshot(source, target):
+    """
+    Given a list of snapshots (which are dictionaries),
+    return the last common snapshot (also as a dictionary,
+    but a different one).  The inputs are a list, sorted
+    by creation date.
+    
+    The return value -- if any -- will include:
+    - Name:  (str) the name of the snapshot
+    - CreationTime: (int) the creation time of the snapshot.
+      This is taken from the source.
+    Optional values:
+    - incremental: (bool) Whether or not this was an incremental
+      snapshot.  This is always taken from target.
+    - parent: (str) If an incremental snapshot, then the previous
+      snapshot used to create it.  This is always taken from target.
+    - ResumeToken: (str) If the snapshot in question was interrupted,
+      and can be resumed, this will be the value.  This value must be
+      present and equal in both source and target, or else it will not
+      be in the return value.
+    """
+    # We're going to turn the target list into a dictionary, first.
+    target_dict = dict((el["Name"], el) for el in target)
+    # Now we go through the source list, in reversed order, seeing
+    # if the source snapshot is in target.
+    for snap in reversed(source):
+        if snap["Name"] in target_dict:
+            t = target_dict[snap["Name"]]
+            # Great, we found it!
+            rv = {"Name" : snap["Name"], "CreationTime" : int(snap["CreationTime"]) }
+            rv["incremental"] = t.get("incremental", False)
+            if "parent" in t:
+                rv["parent"] = t["parent"]
+            if "ResumeToken" in snap and "ResumeToken" in t:
+                if t["ResumeToken"] == snap["ResumeToken"]:
+                    rv["ResumeToken"] = snap['ResumeToken']
+            return rv
+    return None
+            
 def _merge_snapshots(list1, list2):
     """
     Given a list of snapshots, return a list of
@@ -651,11 +690,11 @@ class ZFSBackup(object):
         otherwise it will be the most recent snapshot.  If snapname is given and
         does not exist, an exception is raised.
 
-        By default, it will first find a list of snapshots in common with the
-        source and target, ordered chronologically (based on the source).
+        After that, we then find the most recent common snapshot from source
+        and target (unless force_full is True, in which case that is set to None).
 
-        If force_full is True, then the snapshot chosen will be sent in its entirety,
-        rather than trying to find a common ancestor for an incremental snapshot.
+        If force_full is False, it will then collect a list of snapshots on the
+        source from the last common snapshot to the last snapshot.
 
         This is the main driver of the backup process, and subclasses should be okay
         with using it.
@@ -679,59 +718,83 @@ class ZFSBackup(object):
         else:
             source_snapshots = self.source_snapshots
             
+        # This is the last snapshot we will send, and we are guaranteed
+        # by this point that it exists on the source.
         last_snapshot = source_snapshots[-1]
         if debug:
             print("last_snapshot = {}".format(last_snapshot), file=sys.stderr)
-        last_common_snapshot = None
+
+        # Next step is to get the last common snapshot.
         if force_full:
-            common_snapshots = []
+            last_common_snapshot = None
         else:
-            common_snapshots = _merge_snapshots(source_snapshots, self.target_snapshots)
-        # At this point, common_snapshots has a list of snapshot names on both.
-        # If there are no common snapshots, then we back up everything up to last_snapshot
+            last_common_snapshot = _last_common_snapshot(source_snapshots,
+                                                         self.target_snapshots)
         if debug:
-            print("ZFSBackup: last_snapshot = {}, common_snapshots = {}".format(last_snapshot,
-                                                                                common_snapshots),
+            print("ZFSBackup: last_snapshot = {}, last_common_snapshot = {}".format(last_snapshot,
+                                                                                    last_common_snapshot),
                   file=sys.stderr)
         snapshot_list = source_snapshots
-        if last_snapshot["Name"] in common_snapshots:
-            # Wait, is this right?  We're all done
-            if debug:
-                print("Wait, is this right?  No snapshots to be done", file=sys.stderr)
-                return
-        elif not common_snapshots:
+        if last_common_snapshot is None:
             # If we have no snapshots in common, then we do all of the snapshots
             pass
+        elif last_common_snapshot["Name"] == last_snapshot["Name"]:
+            # No snapshots to do, we're all done.
+            if debug:
+                print("No snapshots to send", file=sys.stderr)
+            return
         else:
-            # Okay, so the last snapshot we care about isn't in the list of common snapshots.
-            # That means we want to get all the snapshots from the last common one.
-            last_common_snapshot = common_snapshots[-1]
-            for start_indx, snap in enumerate(source_snapshots):
-                if snap["Name"] == last_common_snapshot:
+            # We have a snapshot in common in source and target,
+            # and we want to get a list of snapshots from last_common_snapshot
+            # to last_snapshot from snapshot_list
+            # To do this, we're going to go through snapshot_list, looking
+            # for the index of both last_common_snapshot and last_snapshot.
+            lcs_index = None
+            last_index = None
+            for indx, snap in enumerate(snapshot_list):
+                if snap['Name'] == last_snapshot['Name']:
+                    last_index = indx
                     break
-            snapshot_list = source_snapshots[start_indx:]
-            
+                if snap['Name'] == last_common_snapshot['Name']:
+                    lcs_index = indx
+            # Now we're going to do a bit of sanity checking:
+            if last_index < lcs_index or lcs_index is None:
+                # This seems a weird case -- the snapshot we've been
+                # told to do is before the last common one.
+                raise ZFSBackupError("Last snapshot in source ({}) is before last common snapshot ({})".format(last_snapshot['Name'], last_common_snapshot['Name']))
+            snapshot_list = snapshot_list[lcs_index:last_index]
+
         if debug:
-            print("Last common snapshot = {}".format(last_common_snapshot), file=sys.stderr)
-            print("\tDoing snapshots {}".format([x["Name"] for x in snapshot_list]), file=sys.stderr)
-        # There are two approaches that could be done here.
-        # One is to do incremental sends for every snapshot; the other
-        # is simply to do a send -I.  I'm choosing the former
-        # If we have a last common snapshot, we can do an incremental from it to
-        # the last snapshot; if we don't, we'll need to do a full send.
+            print("Last common snapshot = {}".format(last_common_snapshot),
+                  file=sys.stderr)
+            print("\tDoing snapshots {}".format(" ".join([x["Name"] for x in snapshot_list])),
+                  file=sys.stderr)
+
+        # At this point, snapshot_list either starts with the
+        # last common snapshot, or there were no common snapshots.
         for snapshot in snapshot_list:
-            if snapshot["Name"] == last_common_snapshot:
-                continue
+            if snapshot["Name"] == last_common_snapshot["Name"]:
+                # If we're resuming a send, we want to continue
+                if "ResumeToken" in last_common_snapshot:
+                    resume = last_common_snapshot["ResumeToken"]
+                else:
+                    continue
+            else:
+                resume = None
             command = ["/sbin/zfs", "send"]
             if self.recursive:
                 command.append("-R")
             backup_dict = { "Name": snapshot["Name"] }
             backup_dict["Recursive"] = self.recursive
-            
+            if resume:
+                command.extend(["-C", resume])
+                backup_dict["ResumeToken"] = resume
+                last_common_snapshot = None
+                
             if last_common_snapshot:
-                command.extend(["-i", "{}".format(last_common_snapshot)])
+                command.extend(["-i", "{}".format(last_common_snapshot["Name"])])
                 backup_dict["incremental"] = True
-                backup_dict["parent"] = last_common_snapshot
+                backup_dict["parent"] = last_common_snapshot["Name"]
             else:
                 backup_dict["incremental"] = False
             backup_dict["CreationTime"] = snapshot["CreationTime"]
@@ -759,7 +822,7 @@ class ZFSBackup(object):
                         snapshot_handler(stage="complete", **backup_dict)
                 self._finish_filters()
             # Set the last_common_snapshot to make the next iteration an incremental
-            last_common_snapshot = snapshot["Name"]
+            last_common_snapshot = snapshot
 
         return
 
@@ -1146,9 +1209,10 @@ class ZFSBackupS3(ZFSBackupDirectory):
                             "StorageClass" : "GLACIER"
                         },
                     ],
-                    'AbortIncompleteMultipartUpload' : {
-                        'DaysAfterInitiation' : 7,
-                    },
+# Does this prevent transitions from working?
+#                    'AbortIncompleteMultipartUpload' : {
+#                        'DaysAfterInitiation' : 7,
+#                    },
                 }
                 rule_indx = len(rules)
                 rules.append(new_rule)
