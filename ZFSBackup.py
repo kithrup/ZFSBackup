@@ -1312,7 +1312,6 @@ class ZFSBackupS3(ZFSBackupDirectory):
             total = 0
             uploader = self.s3.create_multipart_upload(Bucket=self.bucket,
                                                        ACL='private',
-                                                       StorageClass='STANDARD_IA',
                                                        Key=chunk_key)
             upload_id = uploader['UploadId']
             parts = []
