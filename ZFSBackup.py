@@ -773,14 +773,16 @@ class ZFSBackup(object):
         # At this point, snapshot_list either starts with the
         # last common snapshot, or there were no common snapshots.
         for snapshot in snapshot_list:
-            if snapshot["Name"] == last_common_snapshot["Name"]:
+            resume = None
+            if last_common_snapshot and snapshot["Name"] == last_common_snapshot["Name"]:
                 # If we're resuming a send, we want to continue
-                if "ResumeToken" in last_common_snapshot:
-                    resume = last_common_snapshot["ResumeToken"]
-                else:
+                resume = last_common_snapshot.get("ResumeToken", None)
+                if not resume:
+                    # We want to skip the last common snapshot,
+                    # so we can use it as the base of an incremental send
+                    # in the next pass
                     continue
-            else:
-                resume = None
+
             command = ["/sbin/zfs", "send"]
             if self.recursive:
                 command.append("-R")
@@ -789,7 +791,6 @@ class ZFSBackup(object):
             if resume:
                 command.extend(["-C", resume])
                 backup_dict["ResumeToken"] = resume
-                last_common_snapshot = None
                 
             if last_common_snapshot:
                 command.extend(["-i", "{}".format(last_common_snapshot["Name"])])
@@ -1575,10 +1576,43 @@ class ZFSBackupCount(ZFSBackup):
     def count(self):
         return self._count
     
-def main():
+def parse_operation(args):
+    """
+    Determine which operation, and what options for it.
+    Default is to just parse ["backup"]
+    """
+    import argparse
+    
+    def to_bool(s):
+        if s.lower() in ("yes", "1", "true", "t", "y"):
+            return True
+        return False
+
+    parser = argparse.ArgumentParser(description="Operation and options")
+    parser.register('type', 'bool', to_bool)
+
+    if not args:
+        args = ["backup"]
+
+    ops = parser.add_subparsers(help='sub-operation help', dest='command')
+
+    # The current valid operations are backup, restore, list, verify, and delete
+    # Although only backup and restore are currently implemented
+    backup_operation = ops.add_parser("backup", help="Backup command")
+
+    restore_operation = ops.add_parser("restore", help='Restore command')
+
+    verify_operation = ops.add_parser("verify", help='Verify command')
+
+    delete_operation = ops.add_parser('delete', help='Delete command')
+
+    rv = parser.parse_args(args)
+    return rv
+
+def parse_arguments(args=None):
     global debug, verbose
     import argparse
-
+    
     def to_bool(s):
         if s.lower() in ("yes", "1", "true", "t", "y"):
             return True
@@ -1601,14 +1635,11 @@ def main():
                         action='store_true',
                         default=False,
                         help='Recursively replicate')
-    group = parser.add_mutually_exclusive_group(required=True)
-    
-    group.add_argument('--snapshot', '-S', dest='snapshot_name',
-                       default=None,
-                       help='Snapshot to backup')
-    group.add_argument('--dataset', '--pool', dest='snapshot_name',
-                       default=None,
-                       help='Dataset or pool to back up')
+     
+    parser.add_argument("--snapshot", "-S", "--dataset", "--pool",
+                        dest='snapshot_name',
+                        default=None,
+                        help='Dataset/pool/snapshot to back up')
     
     parser.add_argument("--encrypted", "-E", dest='encrypted',
                         action='store_true', default=False,
@@ -1637,9 +1668,11 @@ def main():
     zfs_parser.add_argument('--dest', '-D', dest='destination',
                             required=True,
                             help='Pool/dataset target for replication')
+    zfs_parser.add_argument("rest", nargs=argparse.REMAINDER)
 
     counter_parser = subparsers.add_parser('counter',
                                            help='Count replication bytes')
+    counter_parser.add_argument("rest", nargs=argparse.REMAINDER)
 
     # ssh parser has a lot more options
     ssh_parser = subparsers.add_parser("ssh",
@@ -1652,7 +1685,8 @@ def main():
                             help='Remote hostname')
     ssh_parser.add_argument("--user", '-U', dest='remote_user',
                             help='Remote user (defaults to current user)')
-    
+    ssh_parser.add_argument("rest", nargs=argparse.REMAINDER)
+
     # Directory parser has only two options
     directory_parser = subparsers.add_parser("directory",
                                         help='Save snapshots to a directory')
@@ -1660,7 +1694,8 @@ def main():
                                   help='Path to store snapshots')
     directory_parser.add_argument("--prefix", "-P", dest='prefix', default=None,
                                   help='Prefix to use when saving snapshots (defaults to hostname)')
-    
+    directory_parser.add_argument("rest", nargs=argparse.REMAINDER)
+
     # S3 parser has many options
     s3_parser = subparsers.add_parser("s3", help="Save snapshots to an S3 server")
     s3_parser.add_argument("--bucket", dest='bucket_name', required=True,
@@ -1681,8 +1716,20 @@ def main():
                            type=bool, help='Use Glacier transitioning')
     s3_parser.add_argument('--region', dest='region', default=None,
                            help='S3 Region to use')
+    s3_parser.add_argument("rest", nargs=argparse.REMAINDER)
     
-    args = parser.parse_args()
+    rv = parser.parse_args(args)
+    return rv
+    
+
+def main():
+    global debug, verbose
+
+    args = parse_arguments()
+
+    operation = parse_operation(args.rest)
+    
+    # Start doing some sanity checks
 
     # Due to the complexity of encryption, we need to handle
     # some cases that (as far as I can tell) argparse doesn't.
@@ -1745,7 +1792,7 @@ def main():
                                                     password_file=args.password_file)
         backup.AddFilter(encrypted_filter)
         
-    if args.operation == "backup":
+    if operation.command == "backup":
         def handler(**kwargs):
             stage = kwargs.get("stage", "")
             if stage == "start":
@@ -1759,7 +1806,7 @@ def main():
         backup.backup(snapname=snapname, snapshot_handler=handler if verbose else None)
         if args.verbose:
             print("Done with backup");
-    elif args.operation == "list":
+    elif operation.command == "list":
         # List snapshots
         if debug:
             print("Listing snapshots", file=sys.stderr)
@@ -1781,7 +1828,7 @@ def main():
             print(output)
 
 
-    if args.operation in ("backup", "restore"):
+    if operation.command in ("backup", "restore"):
         if isinstance(backup, ZFSBackupCount):
             output = "{} bytes".format(backup.count)
             print(output)
