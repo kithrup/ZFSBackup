@@ -107,7 +107,6 @@ def _get_snapshots(ds):
     This only works for local ZFS pools, obviously.
     It relies on /sbin/zfs sorting, rather than sorting itself.
     """
-    print("_get_snapshots({})".format(ds), file=sys.stderr)
     try:
         if "/" in ds:
             # It's a dataset, easy enough to use
