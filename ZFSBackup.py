@@ -17,6 +17,13 @@ verbose = False
 
 ZFS = libzfs.ZFS()
 
+def _cloxec(fd):
+    # Simple function to set the close-on-exec flag
+    import fcntl
+
+    flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+    fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+    
 def _last_common_snapshot(source, target):
     """
     Given a list of snapshots (which are dictionaries),
@@ -100,7 +107,7 @@ def _get_snapshots(ds):
     This only works for local ZFS pools, obviously.
     It relies on /sbin/zfs sorting, rather than sorting itself.
     """
-    command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation,receive_resume_token",
+    command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation,receive_resume_token,createtxg",
                "-r", "-d", "1", "-t", "snapshot", "-s", "creation",
                ds]
     if debug:
@@ -114,9 +121,9 @@ def _get_snapshots(ds):
     for snapshot in output:
         if not snapshot:
             continue
-        (name, ctime, resume_token) = snapshot.rstrip().split()
+        (name, ctime, resume_token, txg) = snapshot.rstrip().split()
         name = name.split('@')[1]
-        d = { "Name" : name, "CreationTime" : int(ctime) }
+        d = { "Name" : name, "CreationTime" : int(ctime), "CreateTxg" : int(txg) }
         if resume_token != "-":
             d["ResumeToken"] = resume_token
         snapshots.append(d)
@@ -260,8 +267,7 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
         # We need to set F_CLOEXEC on the output_pipe, or
         # a subsequent Popen call will keep a dangling open
         # reference around.
-        flags = fcntl.fcntl(self.output_pipe, fcntl.F_GETFD)
-        fcntl.fcntl(self.output_pipe, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+        _cloxec(self.output_pipe)
         self._py_read = os.fdopen(self.input_pipe, "rb")
         self.thread = threading.Thread(target=self.run)
         self.thread.daemon = True
@@ -632,15 +638,17 @@ class ZFSBackup(object):
         can get out of date.
         """
         if not self._source_snapshots:
-            self._source_snapshots = []
+            snaplist = []
             for snap in self.source_zfs.snapshots:
                 tmp = {
                     "Name" : snap.snapshot_name,
-                    "CreationTime" : int(snap.properties['creation'].rawvalue)
+                    "CreationTime" : int(snap.properties['creation'].rawvalue),
+                    "CreateTxg" : int(snap.properties['createtxg'].rawvalue),
                 }
                 if "resume_token" in snap.properties:
                     tmp['ResumeToken'] = snap.properties['ResumeToken']
-                self._source_snapshots.append(tmp)
+                snaplist.append(tmp)
+            self._source_snapshots = sorted(snaplist, key=lambda snap: snap["CreateTxg"])
         return self._source_snapshots
 
     @property
@@ -698,13 +706,24 @@ class ZFSBackup(object):
         with open("/dev/null", "w+") as devnull:
             for d in self.source.split("/")[1:]:
                 full_path = os.path.join(full_path, d)
-                command = ["/sbin/zfs", "create", "-o", "readonly=on", full_path]
-                if debug:
-                    print("Running command {}".format(" ".join(command)), file=sys.stderr)
-                try:
-                    CALL(command, stdout=devnull, stderr=devnull)
-                except:
-                    pass
+                if True:
+                    command = ["/sbin/zfs", "create", "-o", "readonly=on", full_path]
+                    if debug:
+                        print("Running command {}".format(" ".join(command)), file=sys.stderr)
+                    try:
+                        CALL(command, stdout=devnull, stderr=devnull)
+                    except:
+                        pass
+                    else:
+                        pool = self.source_zfs.pool
+                        try:
+                            pool.create(full_path, { "readonly" : "on" })
+                        except libzfs.ZFSException as e:
+                            if e.code == libzfs.Error.EXISTS:
+                                pass
+                            else:
+                                print("Got exception code = {}, message = {} while trying to create {}".format(e.code, e.message, full_path), file=sys.stderr)
+
         # Now we just send the data to zfs recv.
         # Do we need -p too?
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
@@ -736,6 +755,24 @@ class ZFSBackup(object):
         with using it.
 
         """
+        # Helper function for the zfs threading
+        def zfs_send_func(*args, **kwargs):
+            (fd, toname) = args
+            fromname = kwargs.get("last_snapshot_name", None)
+            resume_token = kwargs.get("ResumeToken", None)
+            flags = 0
+            if self.recursive:
+                flags |= libzfs.REPLICATE
+            try:
+                if resume_token:
+                    self.source_zfs.send_resume(fd, resume_token, flags=flags)
+                else:
+                    self.source_zfs.send(fd, toname=toname, fromname=fromname)
+            except libzfs.ZFSException as e:
+                print("Got exception {} during zfs.send".format(str(e)), file=sys.stderr)
+            # Need to close it or the poor pipe will never notice.
+            os.close(fd)
+            
         # First, if snapname is given, let's make sure that it exists on the source.
         if snapname:
             # If snapname has the dataset in it, let's remove it
@@ -840,23 +877,51 @@ class ZFSBackup(object):
                 print(" ".join(command), file=sys.stderr)
 
             with tempfile.TemporaryFile() as error_output:
-                with open("/dev/null", "w+") as devnull:
-                    mByte = 1024 * 1024
-                    send_proc = POPEN(command,
-                                      bufsize=mByte,
-                                      stdin=devnull,
-                                      stderr=error_output,
-                                      stdout=subprocess.PIPE)
-                    if debug:
-                        print("backup_dict = {}".format(backup_dict), file=sys.stderr)
-                    if callable(snapshot_handler):
-                        snapshot_handler(stage="start", **backup_dict)
-                    self.backup_handler(send_proc.stdout, **backup_dict)
-                    if send_proc.returncode:
-                        error_output.seek(0)
-                        raise ZFSBackupError(error_output.read())
-                    if callable(snapshot_handler):
-                        snapshot_handler(stage="complete", **backup_dict)
+                """
+                To do this with libzfs, we would need to create a pipe,
+                and a thread, because source_zfs.send() takes a file descriptor
+                to write to, and we need to be able to read from it without
+                blocking.
+                """
+                if True:
+                    (rside, wside) = os.pipe()
+                    _cloxec(rside)
+                    _cloxec(wside)
+                    zfs_thread = threading.Thread(target=zfs_send_func,
+                                                  args=(wside, snapshot["Name"]),
+                                                  kwargs={
+                                                      "ResumeToken" : resume,
+                                                      "last_snapshot_name" : backup_dict.get("parent", None)
+                                                  })
+                    zfs_thread.start()
+                    try:
+                        if callable(snapshot_handler):
+                            snapshot_handler(stage="start", **backup_dict)
+                        with os.fdopen(rside, "rb") as in_stream:
+                            self.backup_handler(in_stream, **backup_dict)
+                    except:
+                        print("Got an exception while running the backup handler", file=sys.stderr)
+                        raise
+                    finally:
+                        zfs_thread.join()
+                else:
+                    with open("/dev/null", "w+") as devnull:
+                        mByte = 1024 * 1024
+                        send_proc = POPEN(command,
+                                          bufsize=mByte,
+                                          stdin=devnull,
+                                          stderr=error_output,
+                                          stdout=subprocess.PIPE)
+                        if debug:
+                            print("backup_dict = {}".format(backup_dict), file=sys.stderr)
+                        if callable(snapshot_handler):
+                            snapshot_handler(stage="start", **backup_dict)
+                        self.backup_handler(send_proc.stdout, **backup_dict)
+                        if send_proc.returncode:
+                            error_output.seek(0)
+                            raise ZFSBackupError(error_output.read())
+                if callable(snapshot_handler):
+                    snapshot_handler(stage="complete", **backup_dict)
                 self._finish_filters()
             # Set the last_common_snapshot to make the next iteration an incremental
             last_common_snapshot = snapshot
