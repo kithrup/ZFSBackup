@@ -540,12 +540,13 @@ class ZFSBackup(object):
         on the source and target.
         """
         self.target = target
+        self.source = source
         if "/" in source:
             # This means a dataset
-            self.source = ZFS.get_dataset(source)
+            self.source_zfs = ZFS.get_dataset(source)
         else:
             # Else it's a pool, so let's get the root dataset
-            self.source = ZFS.get(source).root_dataset
+            self.source_zfs = ZFS.get(source).root_dataset
         self.recursive = recursive
         self._source_snapshots = None
         self._target_snapshots = None
@@ -632,7 +633,7 @@ class ZFSBackup(object):
         """
         if not self._source_snapshots:
             self._source_snapshots = []
-            for snap in self.source.snapshots:
+            for snap in self.source_zfs.snapshots:
                 tmp = {
                     "Name" : snap.snapshot_name,
                     "CreationTime" : int(snap.properties['creation'].rawvalue)
