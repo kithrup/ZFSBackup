@@ -10,9 +10,12 @@ import errno
 import boto3
 import botocore
 import socket
-        
+import libzfs
+
 debug = True
 verbose = False
+
+ZFS = libzfs.ZFS()
 
 def _last_common_snapshot(source, target):
     """
@@ -290,16 +293,20 @@ class ZFSBackupFilterCounter(ZFSBackupFilterThread):
     A sample thread filter.  All this does is count the
     bytes that come in to be processed.
     """
-    def __init__(self, handler=None):
+    def __init__(self, handler=None, name="ZFS Count Filter"):
         super(ZFSBackupFilterCounter, self).__init__()
         self._count = 0
         self.handler = handler
-        
+        if name:
+            self._name = name
+
     @property
     def name(self):
-        return "ZFS Count Filter"
+        return self._name
 
     def process(self, b):
+        if debug:
+            print("ZFSBackupFilterCounter.process(name={}, len={})".format(self.name, len(b)), file=sys.stderr)
         self._count += len(b)
         return b
 
@@ -533,7 +540,12 @@ class ZFSBackup(object):
         on the source and target.
         """
         self.target = target
-        self.source = source
+        if "/" in source:
+            # This means a dataset
+            self.source = ZFS.get_dataset(source)
+        else:
+            # Else it's a pool, so let's get the root dataset
+            self.source = ZFS.get(source).root_dataset
         self.recursive = recursive
         self._source_snapshots = None
         self._target_snapshots = None
@@ -577,21 +589,27 @@ class ZFSBackup(object):
         for f in self._filters:
             f.finish()
             
-    def _filter_backup(self, source, error=sys.stderr):
+    def _filter_backup(self, source, error=sys.stderr, transformative=True):
         # Private method, to stitch the backup filters together.
         input = source
         for f in self._filters:
+            if f.transformative and not transformative:
+                continue
             f.error_output = error
             if debug:
-                print("Starting filter {} ({})".format(f.name, f.backup_command), file=sys.stderr)
+                print("Starting backup filter {} ({})".format(f.name, f.backup_command), file=sys.stderr)
             input = f.start_backup(input)
         return input
     
-    def _filter_restore(self, source, error=None):
+    def _filter_restore(self, source, error=None, transformative=True):
         # Private method, to stitch the restore filters together.
         input = source
         for f in self._filters:
+            if f.transformative and not transformative:
+                continue
             f.error_output = error
+            if debug:
+                print("Starting reatore filter {} ({})".format(f.name, f.backup_command), file=sys.stderr)
             input = f.start_restore(input)
         return input
     
@@ -609,10 +627,19 @@ class ZFSBackup(object):
         Even if the recursive is true, this _only_ lists the snapshots for the
         source (recursive requires that the same snapshot exist on the descendents,
         or it doesn't get backed up).
-        We cache this so we don't have to keep doing a list.
+        We cache this so we don't have to keep doing a list, but that does mean it
+        can get out of date.
         """
         if not self._source_snapshots:
-            self._source_snapshots = _get_snapshots(self.source)
+            self._source_snapshots = []
+            for snap in self.source.snapshots:
+                tmp = {
+                    "Name" : snap.snapshot_name,
+                    "CreationTime" : int(snap.properties['creation'].rawvalue)
+                }
+                if "resume_token" in snap.properties:
+                    tmp['ResumeToken'] = snap.properties['ResumeToken']
+                self._source_snapshots.append(tmp)
         return self._source_snapshots
 
     @property
@@ -681,8 +708,8 @@ class ZFSBackup(object):
         # Do we need -p too?
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
         with tempfile.TemporaryFile() as error_output:
-            # ZFS->ZFS replication doesn't use filters.
-            fobj = stream
+            # ZFS->ZFS replication doesn't transformative filters.
+            fobj = self._filter_backup(stream, error=error_output, transformative=False)
             try:
                 CHECK_CALL(command, stdin=fobj,
                            stderr=error_output)
@@ -1566,7 +1593,6 @@ class ZFSBackupCount(ZFSBackup):
     def validate(self):
         return
     
-        
     def backup_handler(self, stream, **kwargs):
         fobj = self._filter_backup(stream)
         mByte = 1024 * 1024
@@ -1580,6 +1606,7 @@ class ZFSBackupCount(ZFSBackup):
     @property
     def target_snapshots(self):
         return []
+
     @property
     def count(self):
         return self._count
@@ -1786,14 +1813,16 @@ def main():
         sys.exit(1)
 
     before_count = None; after_count = None
+    if verbose:
+        before_count = ZFSBackupFilterCounter(name="Before")
+        backup.AddFilter(before_count)
+
     if args.compressed:
-        if verbose:
-            before_count = ZFSBackupFilterCounter()
-            backup.AddFilter(before_count)
         backup.AddFilter(ZFSBackupFilterCompressed(pigz=args.use_pigz))
-        if verbose:
-            after_count = ZFSBackupFilterCounter()
-            backup.AddFilter(after_count)
+
+    if verbose:
+        after_count = ZFSBackupFilterCounter(name="After")
+        backup.AddFilter(after_count)
             
     if args.encrypted:
         encrypted_filter = ZFSBackupFilterEncrypted(cipher=args.cipher,
