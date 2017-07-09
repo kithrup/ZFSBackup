@@ -29,3 +29,16 @@ HOW TO BACKUP
 
 HOW TO RESTORE
 * Need to ensure datasets are read-write after restoring
+* Restores are either to the latest snapshot, or to a specific snapshot.
+* Restores come into two categories:
+  * Full
+  * Incremental
+  Without a common snapshot, a full restore must be done.
+  An incremental restore needs the name of the snapshot to be
+  restored, and the most recent previous common snapshot.
+
+HOW TO VERIFY
+* ZFS:  nothing to do.
+* ZFS-over-SSH:  Verify datasets exist?
+* Directory:  ensure all listed chunk files exist.
+* S3:  Same as Directory, plus clear up any incomplete multipart uploads
