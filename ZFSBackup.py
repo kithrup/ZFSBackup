@@ -698,23 +698,24 @@ class ZFSBackup(object):
         """
         # Target function for a thread to handle the receive
         def zfs_recv_func(*args, **kwargs):
-            fd = args[0]
+            (fd, dest_zfs) = args
             resume_token = kwargs.get("ResumeToken", None)
             
             try:
-                self.source_zfs.receive(fd, force=True,
-                                        resumable=bool(resume_token))
+                dest_zfs.receive(fd, force=True, nomount=True,
+                                 resumable=bool(resume_token))
             except libzfs.ZFSException as e:
                 print("Got exception {} during zfs receive".format(str(e)), file=sys.stderr)
-                
+                raise
         # First we create the intervening dataset paths.  That is, the
         # equivalent of 'mkdir -p ${target}/${source}'.
         # We don't care if it fails.
         full_path = self.target
+        dest_zfs_handle = ZFS.get_dataset(self.target)
         with open("/dev/null", "w+") as devnull:
             for d in self.source.split("/")[1:]:
                 full_path = os.path.join(full_path, d)
-                pool = self.source_zfs.pool
+                pool = dest_zfs_handle.pool
                 try:
                     pool.create(full_path, { "readonly" : "on" })
                 except libzfs.ZFSException as e:
@@ -730,7 +731,7 @@ class ZFSBackup(object):
         with tempfile.TemporaryFile() as error_output:
             # ZFS->ZFS replication doesn't use transformative filters.
             fobj = self._filter_backup(stream, error=error_output, transformative=False)
-            zfs_recv_func(fobj.fileno(), ResumeToken=backup_dict.get("ResumeToken", None))
+            zfs_recv_func(fobj.fileno(), dest_zfs_handle, ResumeToken=backup_dict.get("ResumeToken", None))
 
         return
 
