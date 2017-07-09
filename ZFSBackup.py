@@ -699,6 +699,7 @@ class ZFSBackup(object):
             except libzfs.ZFSException as e:
                 print("Got exception {} during zfs receive".format(str(e)), file=sys.stderr)
                 raise
+
         # First we create the intervening dataset paths.  That is, the
         # equivalent of 'mkdir -p ${target}/${source}'.
         # We don't care if it fails.
