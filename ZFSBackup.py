@@ -726,15 +726,7 @@ class ZFSBackup(object):
         with tempfile.TemporaryFile() as error_output:
             # ZFS->ZFS replication doesn't use transformative filters.
             fobj = self._filter_backup(stream, error=error_output, transformative=False)
-            if False:
-                try:
-                    CHECK_CALL(command, stdin=fobj,
-                               stderr=error_output)
-                except subprocess.CalledProcessError:
-                    error_output.seek(0)
-                    raise ZFSBackupError(error_output.read())
-            else:
-                zfs_recv_func(fobj.fileno(), ResumeToken=backup_dict.get("ResumeToken", None))
+            zfs_recv_func(fobj.fileno(), ResumeToken=backup_dict.get("ResumeToken", None))
 
         return
 
@@ -883,43 +875,26 @@ class ZFSBackup(object):
                 to write to, and we need to be able to read from it without
                 blocking.
                 """
-                if True:
-                    (rside, wside) = os.pipe()
-                    _cloxec(rside)
-                    _cloxec(wside)
-                    zfs_thread = threading.Thread(target=zfs_send_func,
-                                                  args=(wside, snapshot["Name"]),
-                                                  kwargs={
-                                                      "ResumeToken" : resume,
-                                                      "last_snapshot_name" : backup_dict.get("parent", None)
-                                                  })
-                    zfs_thread.start()
-                    try:
-                        if callable(snapshot_handler):
-                            snapshot_handler(stage="start", **backup_dict)
-                        with os.fdopen(rside, "rb") as in_stream:
-                            self.backup_handler(in_stream, **backup_dict)
-                    except:
-                        print("Got an exception while running the backup handler", file=sys.stderr)
-                        raise
-                    finally:
-                        zfs_thread.join()
-                else:
-                    with open("/dev/null", "w+") as devnull:
-                        mByte = 1024 * 1024
-                        send_proc = POPEN(command,
-                                          bufsize=mByte,
-                                          stdin=devnull,
-                                          stderr=error_output,
-                                          stdout=subprocess.PIPE)
-                        if debug:
-                            print("backup_dict = {}".format(backup_dict), file=sys.stderr)
-                        if callable(snapshot_handler):
-                            snapshot_handler(stage="start", **backup_dict)
-                        self.backup_handler(send_proc.stdout, **backup_dict)
-                        if send_proc.returncode:
-                            error_output.seek(0)
-                            raise ZFSBackupError(error_output.read())
+                (rside, wside) = os.pipe()
+                _cloxec(rside)
+                _cloxec(wside)
+                zfs_thread = threading.Thread(target=zfs_send_func,
+                                              args=(wside, snapshot["Name"]),
+                                              kwargs={
+                                                  "ResumeToken" : resume,
+                                                  "last_snapshot_name" : backup_dict.get("parent", None)
+                                              })
+                zfs_thread.start()
+                try:
+                    if callable(snapshot_handler):
+                        snapshot_handler(stage="start", **backup_dict)
+                    with os.fdopen(rside, "rb") as in_stream:
+                        self.backup_handler(in_stream, **backup_dict)
+                except:
+                    print("Got an exception while running the backup handler", file=sys.stderr)
+                    raise
+                finally:
+                    zfs_thread.join()
                 if callable(snapshot_handler):
                     snapshot_handler(stage="complete", **backup_dict)
                 self._finish_filters()
