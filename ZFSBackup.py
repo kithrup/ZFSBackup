@@ -691,7 +691,7 @@ class ZFSBackup(object):
         
         return
 
-    def backup_handler(self, stream, **kwargs):
+    def backup_handler(self, stream, **backup_dict):
         """
         Method called to write the backup to the target.  In the base class,
         this simply creates the necessary datasets on the target, and then
@@ -699,6 +699,17 @@ class ZFSBackup(object):
         and sets its stdin to stream.
         Subclasses will probably want to replace this method.
         """
+        # Target function for a thread to handle the receive
+        def zfs_recv_func(*args, **kwargs):
+            fd = args[0]
+            resume_token = kwargs.get("ResumeToken", None)
+            
+            try:
+                self.source_zfs.receive(fd, force=True,
+                                        resumable=bool(resume_token))
+            except libzfs.ZFSException as e:
+                print("Got exception {} during zfs receive".format(str(e)), file=sys.stderr)
+                
         # First we create the intervening dataset paths.  That is, the
         # equivalent of 'mkdir -p ${target}/${source}'.
         # We don't care if it fails.
@@ -706,36 +717,32 @@ class ZFSBackup(object):
         with open("/dev/null", "w+") as devnull:
             for d in self.source.split("/")[1:]:
                 full_path = os.path.join(full_path, d)
-                if True:
-                    command = ["/sbin/zfs", "create", "-o", "readonly=on", full_path]
-                    if debug:
-                        print("Running command {}".format(" ".join(command)), file=sys.stderr)
-                    try:
-                        CALL(command, stdout=devnull, stderr=devnull)
-                    except:
+                pool = self.source_zfs.pool
+                try:
+                    pool.create(full_path, { "readonly" : "on" })
+                except libzfs.ZFSException as e:
+                    if e.code == libzfs.Error.EXISTS:
                         pass
                     else:
-                        pool = self.source_zfs.pool
-                        try:
-                            pool.create(full_path, { "readonly" : "on" })
-                        except libzfs.ZFSException as e:
-                            if e.code == libzfs.Error.EXISTS:
-                                pass
-                            else:
-                                print("Got exception code = {}, message = {} while trying to create {}".format(e.code, e.message, full_path), file=sys.stderr)
+                        print("Got exception code = {}, message = {} while trying to create {}".format(e.code, e.message, full_path), file=sys.stderr)
+                        raise
 
         # Now we just send the data to zfs recv.
         # Do we need -p too?
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
         with tempfile.TemporaryFile() as error_output:
-            # ZFS->ZFS replication doesn't transformative filters.
+            # ZFS->ZFS replication doesn't use transformative filters.
             fobj = self._filter_backup(stream, error=error_output, transformative=False)
-            try:
-                CHECK_CALL(command, stdin=fobj,
-                           stderr=error_output)
-            except subprocess.CalledProcessError:
-                error_output.seek(0)
-                raise ZFSBackupError(error_output.read())
+            if False:
+                try:
+                    CHECK_CALL(command, stdin=fobj,
+                               stderr=error_output)
+                except subprocess.CalledProcessError:
+                    error_output.seek(0)
+                    raise ZFSBackupError(error_output.read())
+            else:
+                zfs_recv_func(fobj.fileno(), ResumeToken=backup_dict.get("ResumeToken", None))
+
         return
 
     def backup(self, snapname=None, force_full=False, snapshot_handler=None):
