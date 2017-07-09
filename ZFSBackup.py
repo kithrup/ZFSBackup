@@ -107,26 +107,30 @@ def _get_snapshots(ds):
     This only works for local ZFS pools, obviously.
     It relies on /sbin/zfs sorting, rather than sorting itself.
     """
-    command = ["/sbin/zfs", "list", "-H", "-p", "-o", "name,creation,receive_resume_token,createtxg",
-               "-r", "-d", "1", "-t", "snapshot", "-s", "creation",
-               ds]
-    if debug:
-        print("get_snapshots: {}".format(" ".join(command)), file=sys.stderr)
+    print("_get_snapshots({})".format(ds), file=sys.stderr)
     try:
-        output = CHECK_OUTPUT(command).decode('utf-8').split("\n")
-    except subprocess.CalledProcessError:
-        # We'll assume this is because there are no snapshots
-        return []
-    snapshots = []
-    for snapshot in output:
-        if not snapshot:
-            continue
-        (name, ctime, resume_token, txg) = snapshot.rstrip().split()
-        name = name.split('@')[1]
-        d = { "Name" : name, "CreationTime" : int(ctime), "CreateTxg" : int(txg) }
-        if resume_token != "-":
-            d["ResumeToken"] = resume_token
-        snapshots.append(d)
+        if "/" in ds:
+            # It's a dataset, easy enough to use
+            zfs_ds = ZFS.get_dataset(ds)
+        else:
+            zfs_ds = ZFS.get(ds).root_dataset
+    except libzfs.ZFSException as e:
+        if e.code == libzfs.Error.NOENT:
+            return []
+        print("Got exception {} in _get_snapshots({})".format(str(e), ds), file=sys.stderr)
+        raise
+
+    snaplist = []
+    for snap in zfs_ds.snapshots:
+        tmp = {
+            "Name" : snap.snapshot_name,
+            "CreationTime" : int(snap.properties['creation'].rawvalue),
+            "CreateTxg" : int(snap.properties['createtxg'].rawvalue),
+        }
+        if "resume_token" in snap.properties:
+            tmp['ResumeToken'] = snap.properties['ResumeToken']
+        snaplist.append(tmp)
+    snapshots = sorted(snaplist, key=lambda snap: snap['CreateTxg'])
     return snapshots
 
 class ZFSBackupError(ValueError):
