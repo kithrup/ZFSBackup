@@ -107,17 +107,20 @@ def _get_snapshots(ds):
     This only works for local ZFS pools, obviously.
     It relies on /sbin/zfs sorting, rather than sorting itself.
     """
-    try:
-        if "/" in ds:
-            # It's a dataset, easy enough to use
-            zfs_ds = ZFS.get_dataset(ds)
-        else:
-            zfs_ds = ZFS.get(ds).root_dataset
-    except libzfs.ZFSException as e:
-        if e.code == libzfs.Error.NOENT:
-            return []
-        print("Got exception {} in _get_snapshots({})".format(str(e), ds), file=sys.stderr)
-        raise
+    if type(ds) == str:
+        try:
+            if "/" in ds:
+                # It's a dataset, easy enough to use
+                zfs_ds = ZFS.get_dataset(ds)
+            else:
+                zfs_ds = ZFS.get(ds).root_dataset
+        except libzfs.ZFSException as e:
+            if e.code == libzfs.Error.NOENT:
+                return []
+            print("Got exception {} in _get_snapshots({})".format(str(e), ds), file=sys.stderr)
+            raise
+    else:
+        zfs_ds = ds
 
     snaplist = []
     for snap in zfs_ds.snapshots:
@@ -514,10 +517,13 @@ class ZFSBackup(object):
     on both the source and target.  An empty list on the target will mean
     a full backup is being done; an empty list on the source is a failure.
 
-    Backups can have filters applied to them.  This is not used in the base
-    class (since it only implements ZFS->ZFS), but subclasses may wish to
-    add filters for compression, encryption, or accounting.  Some sample
-    filter classes are provided.
+    Backups can have filters applied to them.  Filters may be transformative
+    (that is, the data is transformed), in which case the filter needs to
+    be able to reverse it.  The base class (since it is only ZFS->ZFS) does
+    not use transformative filters, but non-transformative ones may be used.
+    Subclasses may or may not wish to do the same.  (Any network-transporting
+    one, for example, may wish to use compression.)  Sample filter classes,
+    using both commands and threads, are provided.
 
     Some notes on how replication works:
     * source is the full path to the dataset. *Or* it can be the entire pool.
@@ -550,12 +556,15 @@ class ZFSBackup(object):
         """
         self.target = target
         self.source = source
-        if "/" in source:
-            # This means a dataset
-            self.source_zfs = ZFS.get_dataset(source)
-        else:
-            # Else it's a pool, so let's get the root dataset
-            self.source_zfs = ZFS.get(source).root_dataset
+        try:
+            if "/" in self.source:
+                # This means a dataset
+                self.source_zfs = ZFS.get_dataset(self.source)
+            else:
+                # Else it's a pool, so let's get the root dataset
+                self.source_zfs = ZFS.get(self.source).root_dataset
+        except libzfs.ZFSException:
+            raise ZFSBackupError("Source {} does not exist".format(self.source))
         self.recursive = recursive
         self._source_snapshots = None
         self._target_snapshots = None
@@ -641,17 +650,7 @@ class ZFSBackup(object):
         can get out of date.
         """
         if not self._source_snapshots:
-            snaplist = []
-            for snap in self.source_zfs.snapshots:
-                tmp = {
-                    "Name" : snap.snapshot_name,
-                    "CreationTime" : int(snap.properties['creation'].rawvalue),
-                    "CreateTxg" : int(snap.properties['createtxg'].rawvalue),
-                }
-                if "resume_token" in snap.properties:
-                    tmp['ResumeToken'] = snap.properties['ResumeToken']
-                snaplist.append(tmp)
-            self._source_snapshots = sorted(snaplist, key=lambda snap: snap["CreateTxg"])
+            self._source_snapshots = _get_snapshots(self.source_zfs)
         return self._source_snapshots
 
     @property
@@ -667,14 +666,7 @@ class ZFSBackup(object):
         We cache this so we dont have to keep doing a list.
         """
         if not self._target_snapshots:
-            # See the long discussion above about snapshots.
-            (src_pool, _, src_ds) = self.source.partition("/")
-            if src_ds:
-                target_path = "{}/{}".format(self.target, src_ds)
-            else:
-                target_path = "{}/{}".format(self.target, src_pool)
-                
-            self._target_snapshots = _get_snapshots(target_path)
+            self._target_snapshots = _get_snapshots(self.target_zfs)
         return self._target_snapshots
 
     def validate(self):
@@ -682,16 +674,10 @@ class ZFSBackup(object):
         Ensure the destination exists.  Derived classes will want
         to override this (probably).
         """
-        command = ["/sbin/zfs", "list", "-H", self.target]
         try:
-            with open("/dev/null", "w") as devnull:
-                CHECK_CALL(command, stdout=devnull, stderr=devnull)
-        except subprocess.CalledProcessError:
+            self.target_zfs = ZFS.get_dataset(self.target)
+        except libzfs.ZFSException:
             raise ZFSBackupError("Target {} does not exist".format(self.target))
-        if not self.source_snapshots:
-            # A source with no snapshots cannot be backed up
-            raise ZFSBackupError("Source {} does not have snapshots".format(self.source))
-        
         return
 
     def backup_handler(self, stream, **backup_dict):
