@@ -1833,7 +1833,7 @@ def main():
             output = "{} bytes".format(backup.count)
             print(output)
         
-        if before_count and after_count:
+        if before_count and before_count.count and after_count:
             pct = (after_count.count * 100.0) / before_count.count
             output = "Compressed {} to {} bytes ({:.2f}%)".format(before_count.count,
                                                                   after_count.count,
