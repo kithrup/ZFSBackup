@@ -140,8 +140,9 @@ class ZFSBackupFilter(object):
     the other end as part of the backup and restore.  By default, it's
     true; subclasses can change it, and the object can alter it.
     """
-    def __init__(self):
+    def __init__(self, name="Null Filter"):
         self.transformative = True
+        self._name = name
         
     @property
     def error_output(self):
@@ -152,7 +153,7 @@ class ZFSBackupFilter(object):
     
     @property
     def name(self):
-        return "Null Filter"
+        return self._name
 
     @property
     def transformative(self):
@@ -206,17 +207,13 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
     when a thread closes the write end of the pipe.
     """
     def __init__(self, process=None, name="Thread Filter"):
+        super(ZFSBackupFilterThread, self).__init__(name=name)
         self.thread = None
         self.source = None
         self.input_pipe = None
         self.output_pipe = None
-
-    @property
-    def transformative(self):
-        return False
-    @transformative.setter
-    def transformative(self, b):
-        pass
+        self.transformative = False
+        
     @property
     def backup_command(self):
         return None
@@ -290,14 +287,10 @@ class ZFSBackupFilterCounter(ZFSBackupFilterThread):
     A sample thread filter.  All this does is count the
     bytes that come in to be processed.
     """
-    def __init__(self, handler=None):
-        super(ZFSBackupFilterCounter, self).__init__()
+    def __init__(self, handler=None, name="ZFS Count Filter"):
+        super(ZFSBackupFilterCounter, self).__init__(name=name)
         self._count = 0
         self.handler = handler
-        
-    @property
-    def name(self):
-        return "ZFS Count Filter"
 
     def process(self, b):
         self._count += len(b)
@@ -334,8 +327,8 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
     If restore_command is None, then backup_command will be used.
     """
     def __init__(self, backup_command=["/bin/cat"], restore_command=None,
-                 error=None):
-        super(ZFSBackupFilterCommand, self).__init__()
+                 name='Command-based backup filter', error=None):
+        super(ZFSBackupFilterCommand, self).__init__(name=name)
         self._backup_command=backup_command
         self._restore_command=restore_command
         self.error = error
@@ -448,12 +441,9 @@ class ZFSBackupFilterEncrypted(ZFSBackupFilterCommand):
                            "-pass", "file:{}".format(password_file)]
 
         super(ZFSBackupFilterEncrypted, self).__init__(backup_command=backup_command,
-                                                     restore_command=restore_command)
+                                                       restore_command=restore_command,
+                                                       name='{} encryption filter'.format(self.cipher))
         
-    @property
-    def name(self):
-        return "{} encryption filter".format(self.cipher)
-    
 class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
     """
     A sample command filter, for compressing.
@@ -464,13 +454,17 @@ class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
             self.pigz = True
             backup_command = "/usr/local/bin/pigz"
             restore_command = "/usr/local/bin/unpigz"
+            name='pigz compressor filter'
         else:
             self.pigz = False
             backup_command = "/usr/bin/gzip"
             restore_command = "/usr/bin/gunzip"
+            name='gzip compressor filter'
             
         super(ZFSBackupFilterCompressed, self).__init__(backup_command=[backup_command],
-                                                        restore_command=[restore_command])
+                                                        restore_command=[restore_command],
+                                                        name=name)
+        
     @property
     def name(self):
         return "pigz compress filter" if self.pigz else "gzip compress filter"
