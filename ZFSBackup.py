@@ -233,15 +233,22 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
             return buf
         
     def run(self, *args, **kwargs):
-        while True:
-            b = self.source.read(1024*1024)
-            if b:
-                temp_buf = self.process(b)
-                self._py_write.write(temp_buf)
-            else:
-                break
-        self._py_write.close()
-        
+        # We use a try/finally block to ensure
+        # the write-side is always closed.
+        try:
+            while True:
+                b = self.source.read(1024*1024)
+                if b:
+                    temp_buf = self.process(b)
+                    os.write(self.output_pipe, b)
+                else:
+                    break
+        finally:
+            try:
+                os.close(self.output_pipe)
+            except:
+                pass
+                
     def _start(self, source):
         import fcntl
         
@@ -253,8 +260,8 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
         flags = fcntl.fcntl(self.output_pipe, fcntl.F_GETFD)
         fcntl.fcntl(self.output_pipe, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
         self._py_read = os.fdopen(self.input_pipe, "rb")
-        self._py_write = os.fdopen(self.output_pipe, "wb")
         self.thread = threading.Thread(target=self.run)
+        self.thread.daemon = True
         self.thread.start()
         if debug:
             print("In thread start_{}, returning {}".format(self._mode, self._py_read),
@@ -288,6 +295,7 @@ class ZFSBackupFilterCounter(ZFSBackupFilterThread):
         self._count = 0
         self.handler = handler
         
+    @property
     def name(self):
         return "ZFS Count Filter"
 
