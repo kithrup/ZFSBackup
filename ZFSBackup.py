@@ -720,7 +720,10 @@ class ZFSBackup(object):
 
         return
 
-    def backup(self, snapname=None, force_full=False, snapshot_handler=None):
+    def backup(self, snapname=None,
+               force_full=False,
+               snapshot_handler=None,
+               each_snapshot=True):
         """
         Back up the source to the target.
         If snapname is given, then that will be the snapshot used for the backup,
@@ -732,6 +735,9 @@ class ZFSBackup(object):
 
         If force_full is False, it will then collect a list of snapshots on the
         source from the last common snapshot to the last snapshot.
+
+        each_snapshot indicates whether or not to iterate over each snapshot
+        between the first and last one selected.
 
         This is the main driver of the backup process, and subclasses should be okay
         with using it.
@@ -825,6 +831,12 @@ class ZFSBackup(object):
             print("\tDoing snapshots {}".format(" ".join([x["Name"] for x in snapshot_list])),
                   file=sys.stderr)
 
+        if not each_snapshot:
+            if last_common_snapshot:
+                snapshot_list = (snapshot_list[0], snapshot_list[-1])
+            else:
+                snapshot_list = [snapshot_list[-1]]
+
         # At this point, snapshot_list either starts with the
         # last common snapshot, or there were no common snapshots.
         for snapshot in snapshot_list:
@@ -848,7 +860,7 @@ class ZFSBackup(object):
                 backup_dict["ResumeToken"] = resume
                 
             if last_common_snapshot:
-                command.extend(["-i", "{}".format(last_common_snapshot["Name"])])
+                command.extend(["-i" if each_snapshot else "-I", "{}".format(last_common_snapshot["Name"])])
                 backup_dict["incremental"] = True
                 backup_dict["parent"] = last_common_snapshot["Name"]
             else:
@@ -1725,6 +1737,12 @@ def parse_arguments(args=None):
                         dest='use_pigz', default=False,
                         help='Use pigz to compress')
     
+    incrementals = parser.add_mutually_exclusive_group()
+    incrementals.add_argument("--iterate-incrementals", dest="iterate",
+                              action='store_true', default=True)
+    incrementals.add_argument("--no-iterate-incrementals", dest="iterate",
+                              action='store_false')
+    
     subparsers = parser.add_subparsers(help='sub-command help', dest='subcommand')
 
     # We have a sub parser for each type of replication
@@ -1785,6 +1803,11 @@ def parse_arguments(args=None):
     s3_parser.add_argument("rest", nargs=argparse.REMAINDER)
     
     rv = parser.parse_args(args)
+
+    if rv.subcommand is None:
+        parser.print_help()
+        sys.exit(1)
+        
     return rv
     
 
@@ -1792,9 +1815,9 @@ def main():
     global debug, verbose
 
     args = parse_arguments()
-
-    operation = parse_operation(args.rest)
     
+    operation = parse_operation(args.rest)
+        
     # Start doing some sanity checks
 
     # Due to the complexity of encryption, we need to handle
@@ -1871,7 +1894,10 @@ def main():
         if verbose:
             print("Starting backup of {}".format(dataset))
             
-        backup.backup(snapname=snapname, snapshot_handler=handler if verbose else None)
+        backup.backup(snapname=snapname,
+                      snapshot_handler=handler if verbose else None,
+                      each_snapshot=args.iterate)
+        
         if args.verbose:
             print("Done with backup");
     elif operation.command == "list":
