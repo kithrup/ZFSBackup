@@ -748,14 +748,14 @@ class ZFSBackup(object):
             (fd, toname) = args
             fromname = kwargs.get("last_snapshot_name", None)
             resume_token = kwargs.get("ResumeToken", None)
-            flags = 0
+            flags = set()
             if self.recursive:
-                flags |= libzfs.REPLICATE
+                flags.add(libzfs.SendFlag.REPLICATE)
             try:
                 if resume_token:
                     self.source_zfs.send_resume(fd, resume_token, flags=flags)
                 else:
-                    self.source_zfs.send(fd, toname=toname, fromname=fromname)
+                    self.source_zfs.send(fd, toname=toname, fromname=fromname, flags=flags)
             except libzfs.ZFSException as e:
                 print("Got exception {} during zfs.send".format(str(e)), file=sys.stderr)
             # Need to close it or the poor pipe will never notice.
