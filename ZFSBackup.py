@@ -1220,7 +1220,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
                     "Status" : "Enabled",
                     "Transitions" : [
                         {
-                            "Days" : 1,
+                            "Days" : 0,
                             "StorageClass" : "GLACIER"
                         },
                     ],
@@ -1620,6 +1620,8 @@ def parse_operation(args):
 
     delete_operation = ops.add_parser('delete', help='Delete command')
 
+    list_operation = ops.add_parser("list", help='List command')
+    
     rv = parser.parse_args(args)
     return rv
 
@@ -1635,11 +1637,6 @@ def parse_arguments(args=None):
     parser = argparse.ArgumentParser(description='ZFS snapshot replictor')
     parser.register('type', 'bool', to_bool)
     
-    parser.add_argument("--operation", dest='operation',
-                        default='backup',
-                        choices=["backup", "restore",
-                                 "list", "verify",
-                                 "delete"])
     parser.add_argument("--debug", dest='debug',
                         action='store_true', default=False,
                         help='Turn on debugging')
