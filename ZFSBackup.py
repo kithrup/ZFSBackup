@@ -1135,6 +1135,23 @@ class ZFSBackupDirectory(ZFSBackup):
         for chunk in extra_chunks:
             problems.append(("delete_chunk", chunk))
 
+        # Next pass, let's ensure that the backups have all of
+        # their chunks.
+        # If check_all is True, we'll look at all of the backups,
+        # otherwise just ours.
+
+        if not check_all:
+            backups = [self.source]
+        for backup in backups:
+            for snapshot in self.mapfile[backup]["snapshots"]:
+                name = snapshot["Name"]
+                found_all = True
+                for chunk in snapshot["chunks"]:
+                    if not chunk in directory_chunks:
+                        found_all = False
+                        break
+                if not found_all:
+                    problems.append(("corrupt_snapshot", backup, name))
         return problems
 
 class ZFSBackupS3(ZFSBackupDirectory):
@@ -1921,7 +1938,11 @@ def main():
         if args.verbose:
             print("Done with backup");
     elif operation.command == 'verify':
-        print(backup.Check())    
+        problems = backup.Check()
+        if problems:
+            print(problems)
+        elif verbose:
+            print("No problems")
     elif operation.command == "list":
         # List snapshots
         if debug:
