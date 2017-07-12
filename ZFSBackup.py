@@ -872,6 +872,13 @@ class ZFSBackup(object):
             
         return snapshots
 
+    def Check(self, **kwargs):
+        """
+        A method to do a verification that the backup is okay.
+        In the base class, we don't do anything.
+        """
+        pass
+    
 class ZFSBackupDirectory(ZFSBackup):
     """
     A variant of ZFSBackup that backs up to files, rather than replication.
@@ -1066,6 +1073,70 @@ class ZFSBackupDirectory(ZFSBackup):
     def prefix(self):
         return self._prefix
     
+
+    def _get_all_chunks(self):
+        """
+        Returns a set of all the chunks in self.target/self.prefix/self._chunk_dirname
+        """
+        rv = set()
+        chunk_dir = os.path.join(self.prefix, self._chunk_dirname)
+        for entry in os.listdir(os.path.join(self.target, chunk_dir)):
+            if os.path.isdir(os.path.join(self.target, chunk_dir, entry)):
+                # This shouldn't be the case
+                continue
+            rv.add(os.path.join(chunk_dir, entry))
+        return rv
+    
+    def Check(self, **kwargs):
+        """
+        Method to ensure that the backup is sane.
+        In this case, it means checking that every chunk
+        in the directory is accounted for.  We also check
+        to see if every snapshot has all of the chunks it
+        lists, and ensure that every incrememental snapshot
+        has its parent, all the way to a non-incremental.
+
+        If there are any problems, we return a list of them.
+
+        If cleanup=True in kwargs, we'll clean up the problems
+        (still returning the list).
+
+        N.B. Due to the nature of this method and class, it
+        will remove *all* untracked chunks; however, it will only
+        do a consistency check for the specified dataset, unless
+        check_all=True in kwargs.
+        """
+        problems = []
+        
+        cleanup = kwargs.get("cleanup", False)
+        check_all = kwargs.get("check_all", False)
+
+        # First step is to get the backups from the mapfile.
+        backups = self.mapfile.keys()
+
+        # Next we want to get a list of all the chunks.
+        # These will be relative to the target directory,
+        # so we'll turn them into ${prefix}/${chunkdir}/${chunkname}
+        # Since we don't care about order, but do care about lookup,
+        # we'll put them into a set.
+        directory_chunks = self._get_all_chunks()
+            
+        # Let's now ensure every chunk is accounted for
+        # We put them all into another set
+        mapfile_chunks = set()
+        for backup in self.mapfile.itervalues():
+            for snapshot in backup['snapshots']:
+                for chunk in snapshot['chunks']:
+                    mapfile_chunks.add(chunk)
+
+        # Let's see if there are any extraneous files
+        extra_chunks = directory_chunks - mapfile_chunks
+        # And voila, we have a list of chunks that have gone orphaned
+        for chunk in extra_chunks:
+            problems.append(("delete_chunk", chunk))
+
+        return problems
+
 class ZFSBackupS3(ZFSBackupDirectory):
     """
     Backup to AWS.  Optionally with transitions to glacier.
@@ -1383,6 +1454,24 @@ class ZFSBackupS3(ZFSBackupDirectory):
         List the available regons.
         """
         return boto3.session.Session().get_available_regions('s3')
+    
+    def _get_all_chunks(self):
+        """
+        Returns a set of all the chunks -- keys, in AWS parlance --
+        that begin with self.bucket/self._chunk_dir/self.prefix/
+        """
+        rv = set()
+        last_string = ''
+        while True:
+            response = self.s3.list_objects_v2(Bucket=self.bucket,
+                                               Prefix=os.path.join(self._chunk_dirname, self.prefix),
+                                               StartAfter=last_string)
+            for key in [x.get("Key") for x in response.get("Contents")]:
+                last_string = key
+                rv.add(key)
+            if response.get("IsTruncated") == False:
+                break
+        return rv
     
 class ZFSBackupSSH(ZFSBackup):
     """
@@ -1831,6 +1920,8 @@ def main():
         
         if args.verbose:
             print("Done with backup");
+    elif operation.command == 'verify':
+        print(backup.Check())    
     elif operation.command == "list":
         # List snapshots
         if debug:
