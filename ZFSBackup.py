@@ -1146,6 +1146,8 @@ class ZFSBackupDirectory(ZFSBackup):
             for snapshot in self.mapfile[backup]["snapshots"]:
                 name = snapshot["Name"]
                 found_all = True
+                if verbose:
+                    print("Checking {}@{}".format(backup, name), file=sys.stderr)
                 for chunk in snapshot["chunks"]:
                     if not chunk in directory_chunks:
                         found_all = False
@@ -1723,7 +1725,10 @@ def parse_operation(args):
     restore_operation = ops.add_parser("restore", help='Restore command')
 
     verify_operation = ops.add_parser("verify", help='Verify command')
-
+    verify_operation.add_argument("--all", action='store_true', dest='check_all',
+                                  help='Check every backup for consistency',
+                                  default=False)
+    
     delete_operation = ops.add_parser('delete', help='Delete command')
 
     list_operation = ops.add_parser("list", help='List command')
@@ -1938,7 +1943,7 @@ def main():
         if args.verbose:
             print("Done with backup");
     elif operation.command == 'verify':
-        problems = backup.Check()
+        problems = backup.Check(check_all=operation.check_all)
         if problems:
             print(problems)
         elif verbose:
