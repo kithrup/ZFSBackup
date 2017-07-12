@@ -91,6 +91,31 @@ def POPEN(*args, **kwargs):
         print("POPEN({}, {})".format(args, kwargs), file=sys.stderr)
     return subprocess.Popen(*args, **kwargs)
 
+def _get_snapshot_size_estimate(ds, toname, fromname=None, recursive=False):
+    """
+    Get an estimate of the size of a snapshot.  If fromname is given, it's
+    an incremental, and we start from that.
+    """
+    command = ["/sbin/zfs", "send", "-nPv"]
+    if recursive:
+        command.append("-R")
+    if fromname:
+        command.extend(["-i", "{}@{}".format(ds, fromname)])
+    command.append("{}@{}".format(ds, toname))
+
+    try:
+        output = CHECK_OUTPUT(command, stderr=subprocess.STDOUT)
+        output = output.decode("utf-8").split("\n")
+        for line in output:
+            if line.startswith("size"):
+                (x, y) = line.split()
+                if x == "size":
+                    return int(y)
+    except subprocess.CalledProcessError as e:
+        if verbose:
+            print("`{}` got exception {}".format(" ".join(command), str(e)), file=sys.stderr)
+    return 0
+
 def _get_snapshots(ds):
     """
     Return a list of snapshots for the given dataset.
@@ -802,6 +827,10 @@ class ZFSBackup(object):
                 command.append("-R")
             backup_dict = { "Name": snapshot["Name"] }
             backup_dict["Recursive"] = self.recursive
+            backup_dict["SizeEstimate"] = _get_snapshot_size_estimate(self.source,
+                                                                      snapshot["Name"],
+                                                                      fromname=last_common_snapshot["Name"] if last_common_snapshot else None,
+                                                                      recursive=self.recursive)
             if resume:
                 command.extend(["-C", resume])
                 backup_dict["ResumeToken"] = resume
@@ -813,10 +842,12 @@ class ZFSBackup(object):
             else:
                 backup_dict["incremental"] = False
             backup_dict["CreationTime"] = snapshot["CreationTime"]
+            if debug:
+                print("backup_dict = {}".format(backup_dict), file=sys.stderr)
+                
             command.append("{}@{}".format(self.source, snapshot["Name"]))
             if debug:
                 print(" ".join(command), file=sys.stderr)
-
             with tempfile.TemporaryFile() as error_output:
                 with open("/dev/null", "w+") as devnull:
                     mByte = 1024 * 1024
@@ -1062,6 +1093,11 @@ class ZFSBackupDirectory(ZFSBackup):
             snapshot_dict["parent"] = parent
         if filters:
             snapshot_dict["filters"] = filters
+        for key in kwargs.keys():
+            if key in ("Name", "CreationTime", "incremental", "chunks",
+                       "parent", "filters"):
+                continue
+            snapshot_dict[key] = kwargs.get(key)
             
         current_snapshots.append(snapshot_dict)
         source_map["snapshots"] = current_snapshots
