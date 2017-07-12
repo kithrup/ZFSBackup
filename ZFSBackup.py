@@ -106,25 +106,23 @@ def _get_snapshot_size_estimate(ds, toname, fromname=None, recursive=False):
     Get an estimate of the size of a snapshot.  If fromname is given, it's
     an incremental, and we start from that.
     """
-    command = ["/sbin/zfs", "send", "-nPv"]
-    if recursive:
-        command.append("-R")
-    if fromname:
-        command.extend(["-i", "{}@{}".format(ds, fromname)])
-    command.append("{}@{}".format(ds, toname))
-
+    size = 0
     try:
-        output = CHECK_OUTPUT(command, stderr=subprocess.STDOUT)
-        output = output.decode("utf-8").split("\n")
-        for line in output:
-            if line.startswith("size"):
-                (x, y) = line.split()
-                if x == "size":
-                    return int(y)
-    except subprocess.CalledProcessError as e:
+        snapname = '{}@{}'.format(ds.name, toname)
+        prevname = '{}@{}'.format(ds.name, fromname) if fromname else None
+        snap = ZFS.get_snapshot(snapname)
+        size = snap.get_send_space(fromname=prevname)
+        if debug:
+            print("Snapshot {} ({}) has size estimate {}".format(snapname, prevname, size), file=sys.stderr)
+    except libzfs.ZFSException as e:
         if verbose:
-            print("`{}` got exception {}".format(" ".join(command), str(e)), file=sys.stderr)
-    return 0
+            print("Got an error trying to get size estimate for snapshot {}".format(snapname),
+                  file=sys.stderr)
+    if recursive:
+        for child in ds.children:
+            size += _get_snapshot_size_estimate(child, toname, fromname=fromname, recursive=recursive)
+
+    return size
 
 def _get_snapshots(ds):
     """
@@ -880,7 +878,7 @@ class ZFSBackup(object):
                 command.append("-R")
             backup_dict = { "Name": snapshot["Name"] }
             backup_dict["Recursive"] = self.recursive
-            backup_dict["SizeEstimate"] = _get_snapshot_size_estimate(self.source,
+            backup_dict["SizeEstimate"] = _get_snapshot_size_estimate(self.source_zfs,
                                                                       snapshot["Name"],
                                                                       fromname=last_common_snapshot["Name"] if last_common_snapshot else None,
                                                                       recursive=self.recursive)
