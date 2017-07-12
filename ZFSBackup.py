@@ -101,6 +101,31 @@ def POPEN(*args, **kwargs):
         print("POPEN({}, {})".format(args, kwargs), file=sys.stderr)
     return subprocess.Popen(*args, **kwargs)
 
+def _get_snapshot_size_estimate(ds, toname, fromname=None, recursive=False):
+    """
+    Get an estimate of the size of a snapshot.  If fromname is given, it's
+    an incremental, and we start from that.
+    """
+    command = ["/sbin/zfs", "send", "-nPv"]
+    if recursive:
+        command.append("-R")
+    if fromname:
+        command.extend(["-i", "{}@{}".format(ds, fromname)])
+    command.append("{}@{}".format(ds, toname))
+
+    try:
+        output = CHECK_OUTPUT(command, stderr=subprocess.STDOUT)
+        output = output.decode("utf-8").split("\n")
+        for line in output:
+            if line.startswith("size"):
+                (x, y) = line.split()
+                if x == "size":
+                    return int(y)
+    except subprocess.CalledProcessError as e:
+        if verbose:
+            print("`{}` got exception {}".format(" ".join(command), str(e)), file=sys.stderr)
+    return 0
+
 def _get_snapshots(ds):
     """
     Return a list of snapshots for the given dataset.
@@ -855,6 +880,10 @@ class ZFSBackup(object):
                 command.append("-R")
             backup_dict = { "Name": snapshot["Name"] }
             backup_dict["Recursive"] = self.recursive
+            backup_dict["SizeEstimate"] = _get_snapshot_size_estimate(self.source,
+                                                                      snapshot["Name"],
+                                                                      fromname=last_common_snapshot["Name"] if last_common_snapshot else None,
+                                                                      recursive=self.recursive)
             if resume:
                 command.extend(["-C", resume])
                 backup_dict["ResumeToken"] = resume
@@ -866,10 +895,12 @@ class ZFSBackup(object):
             else:
                 backup_dict["incremental"] = False
             backup_dict["CreationTime"] = snapshot["CreationTime"]
+            if debug:
+                print("backup_dict = {}".format(backup_dict), file=sys.stderr)
+                
             command.append("{}@{}".format(self.source, snapshot["Name"]))
             if debug:
                 print(" ".join(command), file=sys.stderr)
-
             with tempfile.TemporaryFile() as error_output:
                 """
                 To do this with libzfs, we would need to create a pipe,
@@ -936,6 +967,13 @@ class ZFSBackup(object):
             
         return snapshots
 
+    def Check(self, **kwargs):
+        """
+        A method to do a verification that the backup is okay.
+        In the base class, we don't do anything.
+        """
+        pass
+    
 class ZFSBackupDirectory(ZFSBackup):
     """
     A variant of ZFSBackup that backs up to files, rather than replication.
@@ -1119,6 +1157,11 @@ class ZFSBackupDirectory(ZFSBackup):
             snapshot_dict["parent"] = parent
         if filters:
             snapshot_dict["filters"] = filters
+        for key in kwargs.keys():
+            if key in ("Name", "CreationTime", "incremental", "chunks",
+                       "parent", "filters"):
+                continue
+            snapshot_dict[key] = kwargs.get(key)
             
         current_snapshots.append(snapshot_dict)
         source_map["snapshots"] = current_snapshots
@@ -1130,6 +1173,89 @@ class ZFSBackupDirectory(ZFSBackup):
     def prefix(self):
         return self._prefix
     
+
+    def _get_all_chunks(self):
+        """
+        Returns a set of all the chunks in self.target/self.prefix/self._chunk_dirname
+        """
+        rv = set()
+        chunk_dir = os.path.join(self.prefix, self._chunk_dirname)
+        for entry in os.listdir(os.path.join(self.target, chunk_dir)):
+            if os.path.isdir(os.path.join(self.target, chunk_dir, entry)):
+                # This shouldn't be the case
+                continue
+            rv.add(os.path.join(chunk_dir, entry))
+        return rv
+    
+    def Check(self, **kwargs):
+        """
+        Method to ensure that the backup is sane.
+        In this case, it means checking that every chunk
+        in the directory is accounted for.  We also check
+        to see if every snapshot has all of the chunks it
+        lists, and ensure that every incrememental snapshot
+        has its parent, all the way to a non-incremental.
+
+        If there are any problems, we return a list of them.
+
+        If cleanup=True in kwargs, we'll clean up the problems
+        (still returning the list).
+
+        N.B. Due to the nature of this method and class, it
+        will remove *all* untracked chunks; however, it will only
+        do a consistency check for the specified dataset, unless
+        check_all=True in kwargs.
+        """
+        problems = []
+        
+        cleanup = kwargs.get("cleanup", False)
+        check_all = kwargs.get("check_all", False)
+
+        # First step is to get the backups from the mapfile.
+        backups = self.mapfile.keys()
+
+        # Next we want to get a list of all the chunks.
+        # These will be relative to the target directory,
+        # so we'll turn them into ${prefix}/${chunkdir}/${chunkname}
+        # Since we don't care about order, but do care about lookup,
+        # we'll put them into a set.
+        directory_chunks = self._get_all_chunks()
+            
+        # Let's now ensure every chunk is accounted for
+        # We put them all into another set
+        mapfile_chunks = set()
+        for backup in self.mapfile.itervalues():
+            for snapshot in backup['snapshots']:
+                for chunk in snapshot['chunks']:
+                    mapfile_chunks.add(chunk)
+
+        # Let's see if there are any extraneous files
+        extra_chunks = directory_chunks - mapfile_chunks
+        # And voila, we have a list of chunks that have gone orphaned
+        for chunk in extra_chunks:
+            problems.append(("delete_chunk", chunk))
+
+        # Next pass, let's ensure that the backups have all of
+        # their chunks.
+        # If check_all is True, we'll look at all of the backups,
+        # otherwise just ours.
+
+        if not check_all:
+            backups = [self.source]
+        for backup in backups:
+            for snapshot in self.mapfile[backup]["snapshots"]:
+                name = snapshot["Name"]
+                found_all = True
+                if verbose:
+                    print("Checking {}@{}".format(backup, name), file=sys.stderr)
+                for chunk in snapshot["chunks"]:
+                    if not chunk in directory_chunks:
+                        found_all = False
+                        break
+                if not found_all:
+                    problems.append(("corrupt_snapshot", backup, name))
+        return problems
+
 class ZFSBackupS3(ZFSBackupDirectory):
     """
     Backup to AWS.  Optionally with transitions to glacier.
@@ -1448,6 +1574,24 @@ class ZFSBackupS3(ZFSBackupDirectory):
         """
         return boto3.session.Session().get_available_regions('s3')
     
+    def _get_all_chunks(self):
+        """
+        Returns a set of all the chunks -- keys, in AWS parlance --
+        that begin with self.bucket/self._chunk_dir/self.prefix/
+        """
+        rv = set()
+        last_string = ''
+        while True:
+            response = self.s3.list_objects_v2(Bucket=self.bucket,
+                                               Prefix=os.path.join(self._chunk_dirname, self.prefix),
+                                               StartAfter=last_string)
+            for key in [x.get("Key") for x in response.get("Contents")]:
+                last_string = key
+                rv.add(key)
+            if response.get("IsTruncated") == False:
+                break
+        return rv
+    
 class ZFSBackupSSH(ZFSBackup):
     """
     Replicate to a remote host using ssh.
@@ -1681,7 +1825,10 @@ def parse_operation(args):
     restore_operation = ops.add_parser("restore", help='Restore command')
 
     verify_operation = ops.add_parser("verify", help='Verify command')
-
+    verify_operation.add_argument("--all", action='store_true', dest='check_all',
+                                  help='Check every backup for consistency',
+                                  default=False)
+    
     delete_operation = ops.add_parser('delete', help='Delete command')
 
     list_operation = ops.add_parser("list", help='List command')
@@ -1897,6 +2044,12 @@ def main():
         
         if args.verbose:
             print("Done with backup");
+    elif operation.command == 'verify':
+        problems = backup.Check(check_all=operation.check_all)
+        if problems:
+            print(problems)
+        elif verbose:
+            print("No problems")
     elif operation.command == "list":
         # List snapshots
         if debug:
