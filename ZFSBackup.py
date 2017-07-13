@@ -1536,6 +1536,30 @@ class ZFSBackupS3(ZFSBackupDirectory):
                 break
         return rv
     
+    def Check(self, **kwargs):
+        """
+        Check an S3 backup destination.
+        This uses the base class, and then checks for multipart uploads.
+        """
+        from datetime import datetime, timedelta
+        problems = super(ZFSBackupS3, self).Check(**kwargs)
+
+        # Now we check for multipart uploads in our bucket
+        try:
+            uploads = self.s3.list_multipart_uploads(Bucket=self.bucket)
+        except:
+            return problems
+
+        for upload in uploads.get("Uploads", []):
+            upload_id = upload["UploadId"]
+            upload_key = upload["Key"]
+            # Is this correct?
+            initiated = upload["Initiated"]
+            now = datetime.now()
+            delta = now - intitiated
+            if delta.days > 2:
+                problems.append(("stale_multpart_upload", self.bucket, upload_key, upload_id))
+                
 class ZFSBackupSSH(ZFSBackup):
     """
     Replicate to a remote host using ssh.
