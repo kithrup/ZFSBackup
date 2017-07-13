@@ -1135,7 +1135,7 @@ class ZFSBackupDirectory(ZFSBackup):
         If there are any problems, we return a list of them.
 
         If cleanup=True in kwargs, we'll clean up the problems
-        (still returning the list).
+        (still returning the list). (Not yet implemented.)
 
         N.B. Due to the nature of this method and class, it
         will remove *all* untracked chunks; however, it will only
@@ -1179,8 +1179,11 @@ class ZFSBackupDirectory(ZFSBackup):
         if not check_all:
             backups = [self.source]
         for backup in backups:
+            snapshot_names = {}
             for snapshot in self.mapfile[backup]["snapshots"]:
+                # The list is supposed to be in order
                 name = snapshot["Name"]
+                snapshot_names[name] = True
                 found_all = True
                 if verbose:
                     print("Checking {}@{}".format(backup, name), file=sys.stderr)
@@ -1188,8 +1191,13 @@ class ZFSBackupDirectory(ZFSBackup):
                     if not chunk in directory_chunks:
                         found_all = False
                         break
+                if snapshot.get("incremental", False):
+                    if snapshot["parent"] not in snapshot_names:
+                        problems.append(("missing_parent", backup, name, snapshot["parent"]))
                 if not found_all:
                     problems.append(("corrupt_snapshot", backup, name))
+
+                
         return problems
 
 class ZFSBackupS3(ZFSBackupDirectory):
