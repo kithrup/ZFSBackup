@@ -118,6 +118,7 @@ def _get_snapshot_size_estimate(ds, toname, fromname=None, recursive=False):
         if verbose:
             print("Got an error trying to get size estimate for snapshot {}".format(snapname),
                   file=sys.stderr)
+        raise
     if recursive:
         for child in ds.children:
             size += _get_snapshot_size_estimate(child, toname, fromname=fromname, recursive=recursive)
@@ -878,10 +879,15 @@ class ZFSBackup(object):
                 command.append("-R")
             backup_dict = { "Name": snapshot["Name"] }
             backup_dict["Recursive"] = self.recursive
-            backup_dict["SizeEstimate"] = _get_snapshot_size_estimate(self.source_zfs,
-                                                                      snapshot["Name"],
-                                                                      fromname=last_common_snapshot["Name"] if last_common_snapshot else None,
-                                                                      recursive=self.recursive)
+            try:
+                backup_dict["SizeEstimate"] = _get_snapshot_size_estimate(self.source,
+                                                                          snapshot["Name"],
+                                                                          fromname=last_common_snapshot["Name"] if last_common_snapshot else None,
+                                                                          recursive=self.recursive)
+            except:
+                if verbose:
+                    print("Unable to get size estimate for snapshot", file=sys.stderr)
+                    
             if resume:
                 command.extend(["-C", resume])
                 backup_dict["ResumeToken"] = resume
@@ -899,7 +905,7 @@ class ZFSBackup(object):
             command.append("{}@{}".format(self.source, snapshot["Name"]))
             if debug:
                 print(" ".join(command), file=sys.stderr)
-            with tempfile.TemporaryFile() as error_output:
+            with tempfile.TemporaryFile(mode="a+") as error_output:
                 """
                 To do this with libzfs, we would need to create a pipe,
                 and a thread, because source_zfs.send() takes a file descriptor
@@ -2068,12 +2074,14 @@ def main():
         if verbose:
             print("Starting backup of {}".format(dataset))
             
-        backup.backup(snapname=snapname,
-                      snapshot_handler=handler if verbose else None,
-                      each_snapshot=args.iterate)
-        
-        if args.verbose:
-            print("Done with backup");
+        try:
+            backup.backup(snapname=snapname,
+                          snapshot_handler=handler if verbose else None,
+                          each_snapshot=args.iterate)
+            if args.verbose:
+                print("Done with backup");
+        except ZFSBackupError as e:
+            print("Backup failed: {}".format(e.message), file=sys.stderr)
     elif operation.command == 'verify':
         problems = backup.Check(check_all=operation.check_all)
         if problems:
