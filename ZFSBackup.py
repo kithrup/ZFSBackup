@@ -796,7 +796,7 @@ class ZFSBackup(object):
                 # This seems a weird case -- the snapshot we've been
                 # told to do is before the last common one.
                 raise ZFSBackupError("Last snapshot in source ({}) is before last common snapshot ({})".format(last_snapshot['Name'], last_common_snapshot['Name']))
-            snapshot_list = snapshot_list[lcs_index:last_index]
+            snapshot_list = snapshot_list[lcs_index:last_index+1]
 
         if debug:
             print("Last common snapshot = {}".format(last_common_snapshot),
