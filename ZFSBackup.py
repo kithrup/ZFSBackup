@@ -283,7 +283,7 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
         finally:
             try:
                 os.close(self.output_pipe)
-            except:
+            except OSError:
                 pass
                 
     def _start(self, source):
@@ -438,7 +438,7 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
         if self.error:
             try:
                 self.error.close()
-            except:
+            except OSError:
                 pass
             self.error = None
         if self.proc:
@@ -459,7 +459,7 @@ class ZFSBackupFilterEncrypted(ZFSBackupFilterCommand):
             try:
                 ciphers = CHECK_OUTPUT(["/usr/bin/openssl", "list-cipher-commands"]).split()
                 return cipher in ciphers
-            except:
+            except subprocess.CalledProcessError:
                 return False
         if password_file is None:
             raise ValueError("Password file must be set for encryption filter")
@@ -1472,7 +1472,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
             self.s3.head_object(Bucket=self.bucket,
                                 Key=keyname)
             return True
-        except:
+        except botocore.exceptions.ClientError:
             return False
                 
     @property
@@ -1559,6 +1559,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
                                                       UploadId=upload_id,
                                                       MultipartUpload={ "Parts" : parts })
             except:
+                # This blanket exception catch is intentional
                 if verbose:
                     print("Aborting multipart upload after {} parts".format(len(parts)), file=sys.stderr)
                 self.s3.abort_multipart_upload(Bucket=self.bucket,
@@ -1615,7 +1616,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
         # Now we check for multipart uploads in our bucket
         try:
             uploads = self.s3.list_multipart_uploads(Bucket=self.bucket)
-        except:
+        except botocore.exceptions.ClientError:
             return problems
 
         for upload in uploads.get("Uploads", []):
@@ -1754,7 +1755,7 @@ class ZFSBackupSSH(ZFSBackup):
                 command = self._build_command("/sbin/zfs", "create", "-o", "readonly=on", full_path)
                 try:
                     CALL(command, stdout=devnull, stderr=devnull, stdin=devnull)
-                except:
+                except subprocess.CalledProcessError:
                     pass
                 
         # If we have any transformative filters, we need to create them in reverse order.
