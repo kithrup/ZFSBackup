@@ -1275,7 +1275,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
      bucket/
       prefix/
        map.json
-      glacier/
+      chunks/
         data files
 
     The map file maps from dataset to snapshots.
@@ -1286,7 +1286,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
     We control a lifecycle rule for bucket, which we
     will name "${prefix} ZFS Backup Rule"; if glacier
     is enabled, we add that rule, and set glacier migration
-    for "glacier/" for 1 days; if it is not
+    for "chunks/" for 0 days; if it is not
     enabled, then we set the rule to be disabled.  (But
     we always have the rule there.)
 
@@ -1307,8 +1307,8 @@ class ZFSBackupS3(ZFSBackupDirectory):
             "Recursive"    : True,
             "Incremental"  : null,
 	    "Chunks"       : [
-		"glacier/${random}",
-		"glacier/${random}"
+		"chunks/${random}",
+		"chunks/${random}"
 	    ]
          },
 	"auto-daily-2017-01-02:00:00" : {
@@ -1348,7 +1348,6 @@ class ZFSBackupS3(ZFSBackupDirectory):
         super(ZFSBackupS3, self).__init__(source, "",
                                           prefix=prefix,
                                           recursive=recursive)
-        self._chunk_dirname = "glacier"
         self._setup_bucket()
         
     def validate(self):
@@ -1418,7 +1417,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
                 # We need to add it
                 new_rule = {
                     "ID" : rule_id,
-                    "Prefix" : "glacier/".format(self.prefix),
+                    "Prefix" : "{}/".format(self._chunk_dirname),
                     "Status" : "Enabled",
                     "Transitions" : [
                         {
@@ -2103,6 +2102,10 @@ def main():
                 filters = snapshot.get("filters", [])
                 for filter in filters:
                     output += "\n\tFilter: {}".format(" ".join(filter))
+                if "chunks" in snapshot:
+                    output += "\n\tChunks:\n"
+                    for chunk in snapshot["chunks"]:
+                        output += "\t\t{}".format(chunk)
                 for key in snapshot.keys():
                     if key in ("Name", "CreationTime", "incremental",
                                "parent", "chunks", "filters"):
