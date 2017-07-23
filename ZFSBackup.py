@@ -574,6 +574,10 @@ class ZFSBackup(object):
         self._source = s
         
     @property
+    def filters(self):
+        return self._filters
+    
+    @property
     def recursive(self):
         return self._recursive
     @recursive.setter
@@ -594,13 +598,13 @@ class ZFSBackup(object):
         
     def _finish_filters(self):
         # Common method to wait for all filters to finish and clean up
-        for f in self._filters:
+        for f in self.filters:
             f.finish()
             
     def _filter_backup(self, source, error=sys.stderr):
         # Private method, to stitch the backup filters together.
         input = source
-        for f in self._filters:
+        for f in self.filters:
             f.error_output = error
             if debug:
                 print("Starting filter {} ({})".format(f.name, f.backup_command), file=sys.stderr)
@@ -610,7 +614,7 @@ class ZFSBackup(object):
     def _filter_restore(self, source, error=None):
         # Private method, to stitch the restore filters together.
         input = source
-        for f in self._filters:
+        for f in self.filters:
             f.error_output = error
             input = f.start_restore(input)
         return input
@@ -1086,7 +1090,7 @@ class ZFSBackupDirectory(ZFSBackup):
                 raise ZFSBackupError("Snapshot {} is already present in target".format(snapshot_name))
         
         filters = []
-        for f in reversed(self._filters):
+        for f in reversed(self.filters):
             if f.transformative and f.restore_command:
                 filters.append(f.restore_command)
                 
@@ -1707,7 +1711,7 @@ class ZFSBackupSSH(ZFSBackup):
                 
         # If we have any transformative filters, we need to create them in reverse order.
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
-        for filter in reversed(self._filters):
+        for filter in reversed(self.filters):
             if filter.transformative and filter.restore_command:
                 command = filter.restore_command + ["|"] + command
                 
