@@ -36,6 +36,14 @@ HOW TO RESTORE
   Without a common snapshot, a full restore must be done.
   An incremental restore needs the name of the snapshot to be
   restored, and the most recent previous common snapshot.
+* Subclasses have to be able to override the starting snapshot.
+* Prototype:
+  ZFSBackup.restore(self, snapshot_name=None, force_full=False,
+  			  start=None)
+  * If start is specified, use that as the starting snapshot.
+  * If snapshot_name is specified, use that as the snapshot to
+    restore to.  If snapshot_name=None, then restore to the
+    latest snapshot.
 
 HOW TO VERIFY
 * ZFS:  nothing to do.

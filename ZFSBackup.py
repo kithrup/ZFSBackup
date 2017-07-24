@@ -892,6 +892,44 @@ class ZFSBackup(object):
 
         return
 
+    def restore(self, snapshot_name=None,
+                force_full=False,
+                snapshot_handler=None,
+                each_snapshot=True,
+                start_snapshot=None):
+        """
+        Perform a restore.  This is essentially the inverse of backup --
+        the target is the source of data, that are sent to 'zfs recv' (with
+        appropriate flags).
+
+        If snapshot_name is given, then the restore will be done to that
+        snapshot; if force_full is False, the restore will try to find
+        the most recent snapshot in common before snapshot_name, and
+        attempt an incremental restore.  Therefore the most common case
+        for a restore to be done is a full restore to an empty pool/dataset,
+        which may be done at once, or by restoring a series of incrementals.
+
+        Some notes on that:
+        First, a subclass may over-ride that, and in order to back up to
+        the specified snapshot_name, may need to go earlier.  (For example,
+        ZFSBackupDirectory may have to go all the way back to the most recent
+        full backup, if it can't find enough snapshots in common.)
+        Second, if both have the same list of snapshots, then there is
+        no work to be done.  (Should a rollback be done, in that case?)
+        Third, if the backup was recursive, then the restore should be the same.
+        That won't matter for the base class, and similar-functionality subclasses,
+        but for ZFSBackupDirectory-style backups, then the stream being sent
+        will have all of the datasets that were backed up.
+
+        Any filters applied to the backup should be applied to the restore;
+        subclasses that keep track of that information (ZFSBackupDirectory and
+        ZFSBackupS3 at this point) will use their own knowledge of the filters
+        used at backup to apply them in the correct order.  With ZFSBackup and
+        ZFSBackupSSH, that's not necessary, since any data transformations are
+        either ignored or undone as part of the backup process.
+        """
+        pass
+
     @property
     def snapshots(self):
         """
