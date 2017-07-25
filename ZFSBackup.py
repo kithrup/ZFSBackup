@@ -14,6 +14,17 @@ import socket
 debug = True
 verbose = False
 
+def _find_snapshot_index(name, snapshots):
+    """
+    Given a list of snapshots (that is, an ordered-by-creation-time
+    array of dictionaries), return the index.  If it's not found,
+    raise KeyError.
+    """
+    for indx, snapshot in enumerate(snapshots):
+        if snapshot["Name"] == name:
+            return indx
+    raise KeyError(name)
+
 def _last_common_snapshot(source, target):
     """
     Given a list of snapshots (which are dictionaries),
@@ -135,9 +146,12 @@ def _get_snapshots(ds):
         return []
     snapshots = []
     for snapshot in output:
+        snapshot = snapshot.rstrip()
         if not snapshot:
             continue
-        (name, ctime, resume_token) = snapshot.rstrip().split()
+        if debug:
+            print("Output line: {}".format(snapshot), file=sys.stderr)
+        (name, ctime, resume_token) = snapshot.split("\t")
         name = name.split('@')[1]
         d = { "Name" : name, "CreationTime" : int(ctime) }
         if resume_token != "-":
@@ -147,6 +161,17 @@ def _get_snapshots(ds):
 
 class ZFSBackupError(ValueError):
     pass
+
+class ZFSBackupMissingFullBackupError(ZFSBackupError):
+    def __init__(self):
+        super(ZFSBackupMissingFullBackupError).__init__(self,
+                                                        "No full backup available")
+        
+class ZFSBackupSnapshotNotFoundError(ZFSBackupError):
+    def __init__(self, snapname):
+        self.snapshot_name = snapname
+        super(ZFSBackupSnapshotNotFoundError).__init__(self,
+                                                       "Specified snapshot {} does not exist".format(snapname))
 
 class ZFSBackupFilter(object):
     """
@@ -673,10 +698,39 @@ class ZFSBackup(object):
                 CHECK_CALL(command, stdout=devnull, stderr=devnull)
         except subprocess.CalledProcessError:
             raise ZFSBackupError("Target {} does not exist".format(self.target))
-        if not self.source_snapshots:
-            # A source with no snapshots cannot be backed up
-            raise ZFSBackupError("Source {} does not have snapshots".format(self.source))
         
+        return
+
+    def restore_handler(self, stream, **kwargs):
+        """
+        Method called to read a snapshot from the target.  In the base class,
+        this simply does a 'zfs send' (with appropriate options).
+        Unlike the corresponding backup_handler, restore_handler has to handle
+        any setup for incremental sends.  It can know to do an incremental
+        backup by having "parent" in kwargs, which will be the name of the
+        base snapshot.
+        
+        All filters are also set up here.  In the base class, that means
+        no transformative filters (since there's no real point).
+        """
+        command = ["/sbin/zfs", "send"]
+        if self.recursive:
+            command.append("-R")
+        if "ResumeToken" in kwargs:
+            command.extend(["-t", kwargs["ResumeToken"]])
+        if "parent" in kwargs:
+            command.extend(["-I", kwargs["parent"]])
+        command.append("{}@{}".format(self.target, kwargs["Name"]))
+        if debug:
+            print(" ".join(command), file=sys.stderr)
+        with tempfile.TemporaryFile() as error_output:
+            # ZFS->ZFS replication doesn't use filters
+            fobj = stream
+            try:
+                CHECK_CALL(command, stdout=fobj, stderr=error_output)
+            except subprocess.CalledProcessError:
+                error_output.seek(0)
+                raise ZFSBackupError(error_output.read().rstrip())
         return
 
     def backup_handler(self, stream, **kwargs):
@@ -750,7 +804,7 @@ class ZFSBackup(object):
                     snap_index = indx
                     break
             if snap_index is None:
-                raise ZFSBackupError("Specified snapshot {} does not exist".format(snapname))
+                raise ZFSBackupSnapshotNotFoundError(snapname)
             # We want to remove everything in source_snapshots after the given one.
             source_snapshots = self.source_snapshots[0:snap_index+1]
         else:
@@ -892,44 +946,148 @@ class ZFSBackup(object):
 
         return
 
-    def restore(self, snapshot_name=None,
+    def restore(self, snapname=None,
                 force_full=False,
                 snapshot_handler=None,
-                each_snapshot=True,
-                start_snapshot=None):
+                each_snapshot=True):
         """
         Perform a restore.  This is essentially the inverse of backup --
         the target is the source of data, that are sent to 'zfs recv' (with
         appropriate flags).
 
-        If snapshot_name is given, then the restore will be done to that
+        If snapname is given, then the restore will be done to that
         snapshot; if force_full is False, the restore will try to find
-        the most recent snapshot in common before snapshot_name, and
+        the most recent snapshot in common before snapname, and
         attempt an incremental restore.  Therefore the most common case
         for a restore to be done is a full restore to an empty pool/dataset,
         which may be done at once, or by restoring a series of incrementals.
 
-        Some notes on that:
-        First, a subclass may over-ride that, and in order to back up to
-        the specified snapshot_name, may need to go earlier.  (For example,
-        ZFSBackupDirectory may have to go all the way back to the most recent
-        full backup, if it can't find enough snapshots in common.)
-        Second, if both have the same list of snapshots, then there is
-        no work to be done.  (Should a rollback be done, in that case?)
-        Third, if the backup was recursive, then the restore should be the same.
-        That won't matter for the base class, and similar-functionality subclasses,
-        but for ZFSBackupDirectory-style backups, then the stream being sent
-        will have all of the datasets that were backed up.
+        If there is no previous snapshot in common, _or_ force_full is True,
+        then it will need to find the most recent full backup.  In the case
+        of the base class, every snapshot is potentially a full backup, so
+        it can start with snapname.  In the case of ZFSBackupDirectory,
+        however, it will need to search backwards for a full backup.  If there
+        are no full backups, then it will raise an exception.
+
+        If snapname is present in both targt and source, then there will
+        be no work done.  (This would be more suitable for a rollback, after
+        all.)
 
         Any filters applied to the backup should be applied to the restore;
         subclasses that keep track of that information (ZFSBackupDirectory and
         ZFSBackupS3 at this point) will use their own knowledge of the filters
         used at backup to apply them in the correct order.  With ZFSBackup and
         ZFSBackupSSH, that's not necessary, since any data transformations are
-        either ignored or undone as part of the backup process.
+        either ignored or undone as part of the backup process, but compression
+        filters (as an example) may still be helpful to improve overall performance.
         """
-        pass
+        if snapname is None:
+            # Get the last snapshot available on the target
+            snapname = self.target_snapshots[-1]["Name"]
+        try:
+            snapshot_index = _find_snapshot_index(snapname, self.target_snapshots)
+        except KeyError:
+            raise ZFSBackupSnapshotNotFoundError(snapname)
+        
+        # If the snapshot is already in source, then there's nothing to do
+        try:
+            _find_snapshot_index(snapname, self.source_snapshots)
+            return
+        except KeyError:
+            pass
 
+        # We want to make sure we include the desired snapshot name.
+        snapshot_list = self.target_snapshots[:snapshot_index+1]
+
+        # Now let's look for the last common snapshot.
+        # Because of the test above, we know that snapname is not in source.
+        if force_full is False:
+            last_common_snapshot = _last_common_snapshot(self.source_snapshots,
+                                                         snapshot_list)
+        else:
+            last_common_snapshot = None
+
+        # If last_common_snapshot is set, then we need a list of
+        # snapshots on the target between last_common_snapshot and
+        # snapname; if last_common_snapshot is None, then we
+        # need a list of snapshots on the target starting with the
+        # most recent full snapshot.  This is subclass-specific.
+        if last_common_snapshot:
+            start_index = _find_snapshot_index(last_common_snapshot["Name"],
+                                               snapshot_list)
+        else:
+            start_index = self._most_recent_full_backup_index(snapshot_list)
+
+        # This is now a list of snapshots to restore
+        restore_snaps = snapshot_list[start_index:]
+
+        for snap in restore_snaps:
+            # Do I need any other options?  Possibliy if doing
+            # an interrupted restore.
+            resume = None
+            if last_common_snapshot and snap["Name"] == last_common_snapshot["Name"]:
+                # XXX: This isn't right, I think:  we can have a resume token
+                # for a full send.
+                # If we're resuming we want to be able to continue
+                resume = last_common_snapshot.get("ResumeToken", None)
+                if not resume:
+                    # We want to skip the last common snapshot, so we can use it
+                    # as the basis of an incremental send.
+                    continue
+                
+            command = ["/sbin/zfs", "receive", "-d", "-F"]
+            # Copy so we can add some elements to it
+            restore_dict = snap.copy()
+
+            if last_common_snapshot:
+                restore_dict["parent"] = last_common_snapshot["Name"]
+            if resume:
+                restore_dict["ResumeToken"] = resume
+                command.extend(["-t", resume])
+            elif "ResumeToken" in restore_dict:
+                restore_dict.pop("ResumeToken")
+
+            command.append(self.source)
+
+            if debug:
+                print(" ".join(command), file=sys.stderr)
+            with tempfile.TemporaryFile(mode="a+") as error_output:
+                with open("/dev/null", "w+") as devnull:
+                    mByte = 1024 * 1024
+                    if callable(snapshot_handler):
+                        snapshot_handler(state="start", **restore_dict)
+                    recv_proc = POPEN(command,
+                                      bufsize=mByte,
+                                      stdin=subprocess.PIPE,
+                                      stderr=error_output,
+                                      stdout=devnull)
+                    
+                    try:
+                        self.restore_handler(recv_proc.stdin, **restore_dict)
+                    finally:
+                        recv_proc.wait()
+                        if recv_proc.returncode:
+                            # We end up ignoring any errors generated by the filters
+                            error_output.seek(0)
+                            raise ZFSBackupError("Restore failed: {}".format(error_output.read().rstrip()))
+
+                    if callable(snapshot_handler):
+                        snapshot_handler(state="complete", **restore_dict)
+                self._finish_filters()
+            last_common_snapshot = snap
+        return
+    
+    def _most_recent_full_backup_index(self, snapshots):
+        """
+        Given a list of snapshots, find the most recent full backup.
+        If no full backup is given, then it raises an exception.
+        """
+        # For the base class, this is always simply the last snapshot
+        if snapshots:
+            return len(snapshots) - 1
+        else:
+            raise ZFSBackupMissingFullBackupError()
+    
     @property
     def snapshots(self):
         """
@@ -2070,6 +2228,22 @@ def main():
                 print("Done with backup");
         except ZFSBackupError as e:
             print("Backup failed: {}".format(e.message), file=sys.stderr)
+    elif operation.command == "restore":
+        def handler(**kwargs):
+            stage = kwargs.get("stage", "")
+            if stage == "start":
+                print("Starting restore of snapshot {}@{}".format(dataset, kwargs.get("Name")))
+            elif stage == "complete":
+                print("Completed restore of snapshot {}@{}".format(dataset, kwargs.get("Name")))
+        if verbose:
+            print("Starting restore of {}".format(dataset))
+        try:
+            backup.restore(snapname=snapname,
+                           snapshot_handler=handler if verbose else None)
+            if verbose:
+                print("Done with restore")
+        except ZFSBackupError as e:
+            print("Restore failed: {}".format(e.message), file=sys.stderr)
     elif operation.command == 'verify':
         problems = backup.Check(check_all=operation.check_all)
         if problems:
