@@ -713,7 +713,7 @@ class ZFSBackup(object):
         All filters are also set up here.  In the base class, that means
         no transformative filters (since there's no real point).
         """
-        command = ["/sbin/zfs", "send"]
+        command = ["/sbin/zfs", "send", "-p"]
         if self.recursive:
             command.append("-R")
         if "ResumeToken" in kwargs:
@@ -1018,9 +1018,16 @@ class ZFSBackup(object):
         else:
             start_index = self._most_recent_full_backup_index(snapshot_list)
 
+        if debug:
+            print("Last common snapshot = {}".format(last_common_snapshot), file=sys.stderr)
+            print("start_index = {}, snapshot_list = {}".format(start_index, snapshot_list), file=sys.stderr)
+            
         # This is now a list of snapshots to restore
         restore_snaps = snapshot_list[start_index:]
 
+        if debug:
+            print("Restoring snapshots {}".format(restore_snaps), file=sys.stderr)
+            
         for snap in restore_snaps:
             # Do I need any other options?  Possibliy if doing
             # an interrupted restore.
