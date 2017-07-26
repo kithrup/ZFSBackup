@@ -8,7 +8,18 @@ Known Issues
 * Process handling needs significant work.  It doesn't detect
   most failures due to the pipeline.
 
+* Need a way to properly quote command arguments, else whitespace
+  in dataset names will break things.  (This impacts ZFSBacupSSH
+  only for now.)
+
+* Filters with restore don't work -- I'm using the wrong file
+  descriptor/handle in at least one place, and it tries to do
+  a read on a write file or vice versa.
+  
+FIXED:
+
 * Multiple processes & threads seem to not work sometimes.  There
   is a deadlock somewhere, resulting from a file descriptor
   remaining open.
- 
+  As part of commit 7b397c9ab4ce581938bde67461cb7e1d8f057f70
+  
