@@ -287,9 +287,15 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
             while True:
                 b = self.source.read(1024*1024)
                 if b:
+                    if debug:
+                        print("In thread {}, read {} bytes".format(self.name, len(b)), file=sys.stderr)
                     temp_buf = self.process(b)
                     os.write(self.output_pipe, b)
+                    if debug:
+                        print("In thread {}, just wrote {} bytes".format(self.name, len(b)), file=sys.stderr)
                 else:
+                    if debug:
+                        print("In thread {}, done reading from stream".format(self.name), file=sys.stderr)
                     break
         finally:
             try:
@@ -409,7 +415,7 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
         use that.
         """
         if self.error is None:
-            self.error = subprocess.DEVNULL
+            self.error = open("/dev/null", "w+b")
         self.proc = POPEN(self.restore_command,
                           bufsize=1024 * 1024,
                           stdin=source,
@@ -427,7 +433,7 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
         and use that.
         """
         if self.error is None:
-            self.error = open("/dev/null", "wb")
+            self.error = open("/dev/null", "w+b")
         if debug:
             print("start_backup: command = {}, stdin={}, stderr={}".format(" ".join(self.backup_command),
                                                                            source,
@@ -445,14 +451,14 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
         return self.proc.stdout
 
     def finish(self):
+        if self.proc:
+            self.proc.wait()
         if self.error:
             try:
                 self.error.close()
             except OSError:
                 pass
             self.error = None
-        if self.proc:
-            self.proc.wait()
     
 class ZFSBackupFilterEncrypted(ZFSBackupFilterCommand):
     """
@@ -632,7 +638,7 @@ class ZFSBackup(object):
         for f in self.filters:
             f.error_output = error
             if debug:
-                print("Starting filter {} ({})".format(f.name, f.backup_command), file=sys.stderr)
+                print("Starting filter {} ({}), input = {}".format(f.name, f.backup_command, input), file=sys.stderr)
             input = f.start_backup(input)
         return input
     
@@ -916,13 +922,14 @@ class ZFSBackup(object):
             with tempfile.TemporaryFile(mode="a+") as error_output:
                 with open("/dev/null", "w+") as devnull:
                     mByte = 1024 * 1024
-                    send_proc = POPEN(command,
+                    send_proc = POPEN(["/usr/bin/ktrace"] + command,
                                       bufsize=mByte,
                                       stdin=devnull,
                                       stderr=error_output,
                                       stdout=subprocess.PIPE)
                     if debug:
                         print("backup_dict = {}".format(backup_dict), file=sys.stderr)
+                        print("send_proc.stdout = {}".format(send_proc.stdout), file=sys.stderr)
                     if callable(snapshot_handler):
                         snapshot_handler(stage="start", **backup_dict)
                     try:
@@ -935,6 +942,8 @@ class ZFSBackup(object):
                             raise ZFSBackupError(error_output.read().rstrip())
                         else:
                             raise
+                    else:
+                        send_proc.wait()
                     if callable(snapshot_handler):
                         snapshot_handler(stage="complete", **backup_dict)
                 self._finish_filters()
@@ -1953,13 +1962,13 @@ class ZFSBackupSSH(ZFSBackup):
         if debug:
             print("backup command = {}".format(command), file=sys.stderr)
         with tempfile.TemporaryFile() as error_output:
-            fobj = self._filter_backup(stream, error=error_output)
             try:
-                CHECK_CALL(command, stdin=fobj, stderr=error_output)
-            except subprocess.CalledProcessError:
+                fobj = self._filter_backup(stream, error=error_output)
+                command_proc = POPEN(command, stdin=fobj, stderr=error_output)
+                command_proc.wait()
+            except subprocess.CalledProcessError, ZFSBackupError:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read())
-            fobj.close()
         return
     
     @property
@@ -2235,11 +2244,11 @@ def main():
     before_count = None; after_count = None
     if args.compressed:
         if verbose:
-            before_count = ZFSBackupFilterCounter()
+            before_count = ZFSBackupFilterCounter(name="before")
             backup.AddFilter(before_count)
         backup.AddFilter(ZFSBackupFilterCompressed(pigz=args.use_pigz))
         if verbose:
-            after_count = ZFSBackupFilterCounter()
+            after_count = ZFSBackupFilterCounter(name="after")
             backup.AddFilter(after_count)
             
     if args.encrypted:
