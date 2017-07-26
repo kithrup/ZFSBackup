@@ -264,7 +264,12 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
         self.input_pipe = None
         self.output_pipe = None
         self.transformative = False
+        self._mode = None
         
+    @property
+    def mode(self):
+        return self._mode
+    
     @property
     def backup_command(self):
         return None
@@ -285,12 +290,18 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
         # the write-side is always closed.
         try:
             while True:
-                b = self.source.read(1024*1024)
+                if self.mode == "backup":
+                    b = self.stream.read(1024*1024)
+                elif self.mode == "restore":
+                    b = os.read(self.input_pipe, 1024*1024)
                 if b:
                     if debug:
                         print("In thread {}, read {} bytes".format(self.name, len(b)), file=sys.stderr)
                     temp_buf = self.process(b)
-                    os.write(self.output_pipe, b)
+                    if self.mode == "backup":
+                        os.write(self.output_pipe, b)
+                    else:
+                        self.stream.write(b)
                     if debug:
                         print("In thread {}, just wrote {} bytes".format(self.name, len(b)), file=sys.stderr)
                 else:
@@ -299,40 +310,50 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
                     break
         finally:
             try:
-                os.close(self.output_pipe)
+                if self.mode == "backup":
+                    os.close(self.output_pipe)
+                elif self.mode == "restore":
+                    self.stream.close()
             except OSError:
                 pass
                 
-    def _start(self, source):
+    def _start(self, stream):
         import fcntl
         
-        self.source = source
+        self.stream = stream
         (self.input_pipe, self.output_pipe) = os.pipe()
-        # We need to set F_CLOEXEC on the output_pipe, or
-        # a subsequent Popen call will keep a dangling open
+        # We need to set F_CLOEXEC on pipes, lest a
+        # subsequent Popen call keep a dangling open
         # reference around.
         flags = fcntl.fcntl(self.output_pipe, fcntl.F_GETFD)
         fcntl.fcntl(self.output_pipe, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+        fcntl.fcntl(self.input_pipe, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+
         self._py_read = os.fdopen(self.input_pipe, "rb")
+        self._py_write = os.fdopen(self.output_pipe, "wb")
         self.thread = threading.Thread(target=self.run)
         self.thread.daemon = True
         self.thread.start()
+        if self.mode == "backup":
+            rv = self._py_read
+        elif self.mode == "restore":
+            rv = self._py_write
         if debug:
-            print("In thread start_{}, returning {}".format(self._mode, self._py_read),
+            print("In thread start_{}, returning {}".format(self._mode, rv),
                   file=sys.stderr)
-        return self._py_read
+        return rv
     
-    def start_backup(self, source):
+    def start_backup(self, stream):
         if self.thread:
             self.thread = None
         self._mode = "backup"
-        return self._start(source)
+        return self._start(stream)
 
-    def start_restore(self, source):
+    def start_restore(self, stream):
         if self.thread:
             self.thread = None
         self._mode = "restore"
-        return self._start(source)
+        return self._start(stream)
 
     def finish(self):
         if self.thread:
@@ -645,13 +666,15 @@ class ZFSBackup(object):
     def _filter_restore(self, source, error=None):
         # Private method, to stitch the restore filters together.
         # Note that they are in reverse order.
-        input = source
+        output = source
         for f in reversed(self.filters):
             f.error_output = error
             if debug:
-                print("Starting restore filter {} ({})".format(f.name, f.restore_ommand), file=sys.stderr)
-            input = f.start_restore(input)
-        return input
+                print("Starting restore filter {} ({})".format(f.name, f.restore_command), file=sys.stderr)
+            output = f.start_restore(output)
+            if debug:
+                print("\tFilter output = {}".format(output), file=sys.stderr)
+        return output
     
     def __repr__(self):
         return "{}(source={}, target={})".format(self.__class__.__name__, self.source, self.target)
@@ -729,7 +752,11 @@ class ZFSBackup(object):
             command.extend(["-t", kwargs["ResumeToken"]])
         if "parent" in kwargs:
             command.extend(["-I", kwargs["parent"]])
-        command.append("{}@{}".format(self.target, kwargs["Name"]))
+        if "/" in self.source:
+            remote_ds = os.path.join(self.target, self.source.partition("/")[2])
+        else:
+            remote_ds = os.path.join(self.target, self.source)
+        command.append("{}@{}".format(remote_ds, kwargs["Name"]))
         if debug:
             print(" ".join(command), file=sys.stderr)
         with tempfile.TemporaryFile() as error_output:
@@ -922,7 +949,7 @@ class ZFSBackup(object):
             with tempfile.TemporaryFile(mode="a+") as error_output:
                 with open("/dev/null", "w+") as devnull:
                     mByte = 1024 * 1024
-                    send_proc = POPEN(["/usr/bin/ktrace"] + command,
+                    send_proc = POPEN(command,
                                       bufsize=mByte,
                                       stdin=devnull,
                                       stderr=error_output,
@@ -1037,6 +1064,8 @@ class ZFSBackup(object):
         for snap in restore_snaps:
             # Do I need any other options?  Possibliy if doing
             # an interrupted restore.
+            if debug:
+                print("Loop restore {}".format(snap), file=sys.stderr)
             resume = None
             if last_common_snapshot and snap["Name"] == last_common_snapshot["Name"]:
                 # XXX: This isn't right, I think:  we can have a resume token
@@ -1048,7 +1077,7 @@ class ZFSBackup(object):
                     # as the basis of an incremental send.
                     continue
                 
-            command = ["/sbin/zfs", "receive", "-d", "-F"]
+            command = ["/sbin/zfs", "receive", "-e", "-F", "-v"]
             # Copy so we can add some elements to it
             restore_dict = snap.copy()
 
@@ -1060,10 +1089,14 @@ class ZFSBackup(object):
             elif "ResumeToken" in restore_dict:
                 restore_dict.pop("ResumeToken")
 
-            command.append(self.source)
-
+            if "/" in self.source:
+                command.append(os.path.dirname(self.source))
+            else:
+                command.append(self.source)
+                
             if debug:
                 print(" ".join(command), file=sys.stderr)
+
             with tempfile.TemporaryFile(mode="a+") as error_output:
                 with open("/dev/null", "w+") as devnull:
                     mByte = 1024 * 1024
@@ -1840,7 +1873,11 @@ class ZFSBackupSSH(ZFSBackup):
         # Then goes the rest of the command
         command.append(cmd)
         for arg in args:
-            command.append('"{}"'.format(arg))
+            if ' ' in args or '\t' in args:
+                # Really need proper quoting
+                command.append('"{}"'.format(arg))
+            else:
+                command.append(arg)
         return command
     
     def _run_cmd(self, cmd, *args, **kwargs):
@@ -1907,14 +1944,20 @@ class ZFSBackupSSH(ZFSBackup):
         """
         Restore from a remote ZFS dataset (via ssh).
         """
+        if debug:
+            print("ssh restore_handler({}, {})".format(stream, kwargs), file=sys.stderr)
         command = ["/sbin/zfs", "send", "-p"]
         if self.recursive:
             command.append("-R")
         if "ResumeToken" in kwargs:
             command.extend(["-t", kwargs["ResumeToken"]])
-        if parent in kwargs:
+        if "parent" in kwargs:
             command.extend(["-I", kwargs["parent"]])
-        command.append("{}@{}".format(self.target, kwargs["Name"]))
+        if "/" in self.source:
+            remote_ds = os.path.join(self.target, self.source.partition("/")[2])
+        else:
+            remote_ds = os.path.join(self.target, self.source)
+        command.append("{}@{}".format(remote_ds, kwargs["Name"]))
         # If we have any transformative filters, we need to create them in order.
         # Note that, as counterintuitive as it may seem, we use the backup_command for
         # each filter on the remote side.
@@ -1925,8 +1968,9 @@ class ZFSBackupSSH(ZFSBackup):
         command = self._build_command(*command)
         if debug:
             print("Remote restore command: " + " ".join(command), file=sys.stderr)
-
         with tempfile.TemporaryFile() as error_output:
+            if debug:
+                print("In ssh restore_handler, stream = {}".format(stream), file=sys.stderr)
             fobj = self._filter_restore(stream, error=error_output)
             try:
                 CHECK_CALL(command, stdout=fobj, stderr=error_output)
@@ -1935,7 +1979,6 @@ class ZFSBackupSSH(ZFSBackup):
                 raise ZFSBackupError(error_output.read().rstrip())
 
         return
-                
     def backup_handler(self, stream, **kwargs):
         """
         Implement the replication.
