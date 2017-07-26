@@ -1,0 +1,14 @@
+Known Issues
+
+* Deciding the list of known snapshots is broken:
+  if source has snapshots A, B, and C, but the target
+  only has A and C, it will attempt to send an incremental
+  backup of B->C.
+
+* Process handling needs significant work.  It doesn't detect
+  most failures due to the pipeline.
+
+* Multiple processes & threads seem to not work sometimes.  There
+  is a deadlock somewhere, resulting from a file descriptor
+  remaining open.
+ 
