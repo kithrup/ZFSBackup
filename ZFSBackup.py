@@ -729,11 +729,9 @@ class ZFSBackup(object):
         with tempfile.TemporaryFile() as error_output:
             # ZFS->ZFS replication doesn't use filters
             fobj = stream
-            try:
-                CHECK_CALL(command, stdout=fobj, stderr=error_output)
-            except subprocess.CalledProcessError:
-                error_output.seek(0)
-                raise ZFSBackupError(error_output.read().rstrip())
+            with open("/dev/null", "w+") as devnull:
+                POPEN(command, stdout=fobj, stderr=error_output,
+                      stdin=devnull)
         return
 
     def backup_handler(self, stream, **kwargs):
