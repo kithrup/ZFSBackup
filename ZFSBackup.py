@@ -490,10 +490,11 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
             print("{} finished waiting for command, rv = {}".format(self.name,
                                                                     self.proc.returncode),
                   file=sys.stderr)
-        try:
-            args[0].close()
-        except:
-            print("{} got exception on closing {}".format(self.name, args[0]), file=sys.stderr)
+        for f in args:
+            try:
+                f.close()
+            except:
+                print("{} got exception on closing {}".format(self.name, f), file=sys.stderr)
 
     def start_restore(self, source):
         """
@@ -510,7 +511,7 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
                           stdout=source,
                           stdin=subprocess.PIPE,
                           stderr=self.error)
-        thrd = threading.Thread(target=self.proc_wait_thread, args=[source])
+        thrd = threading.Thread(target=self.proc_wait_thread, args=[source, self.proc.stdin])
         thrd.daemon = True
         thrd.start()
         return self.proc.stdin
@@ -540,16 +541,13 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
             print("In start_bauckup for command, source = {}, proc.stdout = {}".format(source,
                                                                                        self.proc.stdout),
                   file=sys.stderr)
-        thrd = threading.Thread(target=self.proc_wait_thread, args=[self.proc.stdout])
-        thrd.daemon = True
-        thrd.start()
-
         return self.proc.stdout
 
     def finish(self):
         if debug:
             print("In command filter {}, calling proc.wait".format(self.name), file=sys.stderr)
-        self.proc.stdin.close()
+        if self.proc.stdin:
+            self.proc.stdin.close()
         if self.proc:
             self.proc.wait()
         if self.error:
