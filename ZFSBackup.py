@@ -11,6 +11,11 @@ import boto3
 import botocore
 import socket
         
+if sys.version_info[0] == 2:
+    from pipes import quote as SHELL_QUOTE
+elif sys.version_info[0] == 3:
+    from shlex import quote as SHELL_QUOTE
+    
 debug = True
 verbose = False
 
@@ -1953,11 +1958,11 @@ class ZFSBackupSSH(ZFSBackup):
         # Then goes the rest of the command
         command.append(cmd)
         for arg in args:
-            if ' ' in args or '\t' in args:
-                # Really need proper quoting
-                command.append('"{}"'.format(arg))
-            else:
+            # We have one exception here, a pipe
+            if arg == '|':
                 command.append(arg)
+            else:
+                command.append(SHELL_QUOTE(arg))
         return command
     
     def _run_cmd(self, cmd, *args, **kwargs):
@@ -2095,8 +2100,7 @@ class ZFSBackupSSH(ZFSBackup):
         with tempfile.TemporaryFile() as error_output:
             try:
                 fobj = self._filter_backup(stream, error=error_output)
-                command_proc = POPEN(command, stdin=fobj, stderr=error_output)
-                command_proc.wait()
+                CHECK_CALL(command, stdin=fobj, stderr=error_output)
             except subprocess.CalledProcessError, ZFSBackupError:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read())
