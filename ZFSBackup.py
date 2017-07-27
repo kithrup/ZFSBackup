@@ -724,9 +724,9 @@ class ZFSBackup(object):
             raise ValueError("Incorrect type passed for filter")
         self._filters.append(filter)
         
-    def _finish_filters(self, backup=True):
+    def _finish_filters(self, reason="backup"):
         # Common method to wait for all filters to finish and clean up
-        for f in self.filters if backup else reversed(self.filters):
+        for f in self.filters if reason == "backup" else reversed(self.filters):
             f.finish()
             
     def _filter_backup(self, source, error=sys.stderr):
@@ -1198,7 +1198,7 @@ class ZFSBackup(object):
                         snapshot_handler(stage="complete", **restore_dict)
                     if debug:
                         print("Calling finish_filters", file=sys.stderr)
-                    self._finish_filters(backup=False)
+                    self._finish_filters(reason="restore")
                     if debug:
                         print("Done calling finish_filters", file=sys.stderr)
             last_common_snapshot = snap
