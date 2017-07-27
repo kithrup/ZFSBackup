@@ -12,14 +12,15 @@ Known Issues
   in dataset names will break things.  (This impacts ZFSBacupSSH
   only for now.)
 
-* Filters with restore don't work -- I'm using the wrong file
-  descriptor/handle in at least one place, and it tries to do
-  a read on a write file or vice versa.
-  
 FIXED:
 
 * Multiple processes & threads seem to not work sometimes.  There
   is a deadlock somewhere, resulting from a file descriptor
   remaining open.
   As part of commit 7b397c9ab4ce581938bde67461cb7e1d8f057f70
+  
+* Filters with restore don't work -- I'm using the wrong file
+  descriptor/handle in at least one place, and it tries to do
+  a read on a write file or vice versa.
+  As part of commit 3f96da221a8cd35d38bec6c1d06d613a2ccc1ff5
   
