@@ -2036,6 +2036,8 @@ class ZFSBackupSSH(ZFSBackup):
             try:
                 CHECK_CALL(command, stdout=fobj, stderr=error_output)
                 print("In ssh restore_handler, command {} has finished".format(" ".join(command)), file=sys.stderr)
+                # How hacky is this?
+                fobj.close()
             except subprocess.CalledProcessError:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read().rstrip())
@@ -2071,7 +2073,6 @@ class ZFSBackupSSH(ZFSBackup):
                 fobj = self._filter_backup(stream, error=error_output)
                 command_proc = POPEN(command, stdin=fobj, stderr=error_output)
                 command_proc.wait()
-
             except subprocess.CalledProcessError, ZFSBackupError:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read())
