@@ -8,10 +8,6 @@ Known Issues
 * Process handling needs significant work.  It doesn't detect
   most failures due to the pipeline.
 
-* Need a way to properly quote command arguments, else whitespace
-  in dataset names will break things.  (This impacts ZFSBacupSSH
-  only for now.)
-
 FIXED:
 
 * Multiple processes & threads seem to not work sometimes.  There
@@ -23,3 +19,8 @@ FIXED:
   descriptor/handle in at least one place, and it tries to do
   a read on a write file or vice versa.
   As part of commit 3f96da221a8cd35d38bec6c1d06d613a2ccc1ff5
+
+* Need a way to properly quote command arguments, else whitespace
+  in dataset names will break things.  (This impacts ZFSBacupSSH
+  only for now.)
+  As part of commit e6bfaa523d8b812e682627162dc4ec0afeaabe40
