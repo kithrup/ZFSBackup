@@ -320,45 +320,44 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
             except OSError:
                 pass
 
-    def run(self, *args, **kwargs):
+    def run_restore(self, *args, **kwargs):
         # We use a try/finally block to ensure
-        # the write-side is always closed.
+        # the stream is always closed
         try:
             while True:
-                if self.mode == "backup":
-                    b = self.stream.read(1024*1024)
-                elif self.mode == "restore":
-                    b = os.read(self.input_pipe, 1024*1024)
+                b = os.read(self.input_pipe, 1024*1024)
                 if b:
                     if debug:
-                        print("In thread {}, read {} bytes".format(self.name, len(b)), file=sys.stderr)
+                        print("In restore thread {}, read {} bytes".format(self.name, len(b)), file=sys.stderr)
                     temp_buf = self.process(b)
                     try:
-                        if self.mode == "backup":
-                            os.write(self.output_pipe, b)
-                        else:
-                            self.stream.write(b)
+                        self.stream.write(temp_buf)
                     except (OSError, IOError) as e:
                         if verbose:
-                            print("In thread {} (mode={}), got exception {}".format(self.name, self.mode, str(e)), file=sys.stderr)
+                            print("In restore thread {0}, trying to write {1} bytes to {2}, got exception {3}".format(
+                                self.name, len(temp_buf), self.stream, str(e)),
+                                  file=sys.stderr)
                         raise
                     if debug:
-                        print("In thread {}, just wrote {} bytes".format(self.name, len(b)), file=sys.stderr)
+                        print("In restore thread {}, just wrote {} bytes".format(self.name, len(temp_buf)), file=sys.stderr)
                 else:
                     if debug:
-                        print("In thread {}, done reading from stream".format(self.name), file=sys.stderr)
+                        print("In restore thread {}, done reading from input pipe".format(self.name), file=sys.stderr)
                     break
+        except BaseException as e:
+            print("In restore thread {}, got exception {}".format(self.name, str(e)), file=sys.stderr)
+            raise
         finally:
+            if debug:
+                print("In restore thread {}, closing stream".format(self.name), file=sys.stderr)
             try:
+                self.stream.close()
+            except BaseException as e:
                 if debug:
-                    print("Thread {}, closing based on mode {}".format(self.name, self.mode), file=sys.stderr)
-                if self.mode == "backup":
-                    os.close(self.output_pipe)
-                elif self.mode == "restore":
-                    os.close(self.input_pipe)
-            except OSError:
-                pass
-                
+                    print("Got exception {} while trying to close stream".format(str(e)), file=sys.stderr)
+            if debug:
+                print("In restore thread {}, done closing files".format(self.name), file=sys.stderr)
+
     def _start(self, stream):
         import fcntl
         
@@ -388,7 +387,7 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
         if self.mode == "backup":
             self.thread = threading.Thread(target=self.run_backup)
         elif self.mode == "restore":
-            self.thread = threading.Thread(target=self.run)
+            self.thread = threading.Thread(target=self.run_restore)
             
         self.thread.daemon = True
         self.thread.start()
@@ -410,9 +409,12 @@ class ZFSBackupFilterThread(ZFSBackupFilter):
         return self._start(stream)
 
     def finish(self):
-        print("In thread filter {}, going to call join".format(self.name), file=sys.stderr)
+        if debug:
+            print("In {} thread filter {}, going to call join".format(self.mode, self.name), file=sys.stderr)
         if self.thread:
             self.thread.join()
+            if debug:
+                print("Done with join!", file=sys.stderr)
         return
     
 class ZFSBackupFilterCounter(ZFSBackupFilterThread):
@@ -482,6 +484,17 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
             self.error.close()
         self._error_output = where
 
+    def proc_wait_thread(self, *args, **kwargs):
+        self.proc.wait()
+        if debug:
+            print("{} finished waiting for command, rv = {}".format(self.name,
+                                                                    self.proc.returncode),
+                  file=sys.stderr)
+        try:
+            args[0].close()
+        except:
+            print("{} got exception on closing {}".format(self.name, args[0]), file=sys.stderr)
+
     def start_restore(self, source):
         """
         source is a file-like object, usually a pipe.
@@ -497,6 +510,9 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
                           stdout=source,
                           stdin=subprocess.PIPE,
                           stderr=self.error)
+        thrd = threading.Thread(target=self.proc_wait_thread, args=[source])
+        thrd.daemon = True
+        thrd.start()
         return self.proc.stdin
     
     def start_backup(self, source):
@@ -524,10 +540,16 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
             print("In start_bauckup for command, source = {}, proc.stdout = {}".format(source,
                                                                                        self.proc.stdout),
                   file=sys.stderr)
+        thrd = threading.Thread(target=self.proc_wait_thread, args=[self.proc.stdout])
+        thrd.daemon = True
+        thrd.start()
+
         return self.proc.stdout
 
     def finish(self):
-        print("In command filter {}, calling proc.wait".format(self.name), file=sys.stderr)
+        if debug:
+            print("In command filter {}, calling proc.wait".format(self.name), file=sys.stderr)
+        self.proc.stdin.close()
         if self.proc:
             self.proc.wait()
         if self.error:
@@ -1176,9 +1198,11 @@ class ZFSBackup(object):
                             raise
                     if callable(snapshot_handler):
                         snapshot_handler(stage="complete", **restore_dict)
-                    print("Calling finish_filters", file=sys.stderr)
-                    self._finish_filters()
-                    print("Done calling finish_filters", file=sys.stderr)
+                    if debug:
+                        print("Calling finish_filters", file=sys.stderr)
+                    self._finish_filters(backup=False)
+                    if debug:
+                        print("Done calling finish_filters", file=sys.stderr)
             last_common_snapshot = snap
         return
     
@@ -2035,9 +2059,11 @@ class ZFSBackupSSH(ZFSBackup):
             fobj = self._filter_restore(stream, error=error_output)
             try:
                 CHECK_CALL(command, stdout=fobj, stderr=error_output)
-                print("In ssh restore_handler, command {} has finished".format(" ".join(command)), file=sys.stderr)
-                # How hacky is this?
+                if debug:
+                    print("In ssh restore_handler, command {} has finished".format(" ".join(command)), file=sys.stderr)
                 fobj.close()
+                if debug:
+                    print("\tfobj {} has been closed".format(fobj), file=sys.stderr)
             except subprocess.CalledProcessError:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read().rstrip())
@@ -2348,15 +2374,21 @@ def main():
         print("Unknown replicator {}".format(args.subcommand), file=sys.stderr)
         sys.exit(1)
 
-    before_count = None; after_count = None
+    uncompressed_size = None; compressed_size = None
     if args.compressed:
-#        if verbose:
-#            before_count = ZFSBackupFilterCounter(name="before")
-#            backup.AddFilter(before_count)
+        if verbose:
+            uncompressed_size = ZFSBackupFilterCounter(name="uncompressed")
+            compressed_size = ZFSBackupFilterCounter(name="compressed")
+            if operation.command == "restore":
+                backup.AddFilter(compressed_size)
+            else:
+                backup.AddFilter(uncompressed_size)
         backup.AddFilter(ZFSBackupFilterCompressed(pigz=args.use_pigz))
-#        if verbose:
-#            after_count = ZFSBackupFilterCounter(name="after")
-#            backup.AddFilter(after_count)
+        if verbose:
+            if operation.command == "restore":
+                backup.AddFilter(uncompressed_size)
+            else:
+                backup.AddFilter(compressed_size)
             
     if args.encrypted:
         encrypted_filter = ZFSBackupFilterEncrypted(cipher=args.cipher,
@@ -2435,10 +2467,10 @@ def main():
             output = "{} bytes".format(backup.count)
             print(output)
         
-        if before_count and before_count.count and after_count:
-            pct = (after_count.count * 100.0) / before_count.count
-            output = "Compressed {} to {} bytes ({:.2f}%)".format(before_count.count,
-                                                                  after_count.count,
+        if uncompressed_size and uncompressed_size.count and compressed_size:
+            pct = (compressed_size.count * 100.0) / uncompressed_size.count
+            output = "Compressed {} to {} bytes ({:.2f}%)".format(uncompressed_size.count,
+                                                                  compressed_size.count,
                                                                   pct)
             print(output)
         
