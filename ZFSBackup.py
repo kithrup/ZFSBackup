@@ -165,7 +165,9 @@ def _get_snapshots(ds):
     return snapshots
 
 class ZFSBackupError(ValueError):
-    pass
+    def __init__(self, message):
+        self.message = message
+        super(ZFSBackupError, self).__init__(message)
 
 class ZFSBackupMissingFullBackupError(ZFSBackupError):
     def __init__(self):
@@ -2101,9 +2103,9 @@ class ZFSBackupSSH(ZFSBackup):
             try:
                 fobj = self._filter_backup(stream, error=error_output)
                 CHECK_CALL(command, stdin=fobj, stderr=error_output)
-            except subprocess.CalledProcessError, ZFSBackupError:
+            except (subprocess.CalledProcessError, ZFSBackupError):
                 error_output.seek(0)
-                raise ZFSBackupError(error_output.read())
+                raise ZFSBackupError(error_output.read().rstrip())
         return
     
     @property

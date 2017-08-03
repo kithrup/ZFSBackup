@@ -5,6 +5,14 @@ Known Issues
   only has A and C, it will attempt to send an incremental
   backup of B->C.
 
+* Disappearing snapshots are a good and tricky question:
+  if a snapshot on source is deleted after generating the
+  list of snapshots, then it will fail, since it cannot
+  do a send from a non-existent snapshot.  This currently will
+  cause the backup to fail, causing another issue, in that
+  errors don't propagate to the return value.  (This may not
+  be a problem for the API.)
+
 * Process handling needs significant work.  It doesn't detect
   most failures due to the pipeline.
 
