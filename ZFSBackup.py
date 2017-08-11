@@ -816,6 +816,14 @@ class ZFSBackup(object):
         
         return
 
+    def prepare_restore(self, *args, **kwargs):
+        """
+        Method called to prepare for restoring.  This can be anything necessary
+        to get snapshots ready to be restored; the base class doesn't do anything
+        about it, however.  S3 needs to ensure that all of the snapshot chunks
+        are transitioned to be read.
+        """
+        pass
     def restore_handler(self, stream, **kwargs):
         """
         Method called to read a snapshot from the target.  In the base class,
@@ -1144,6 +1152,9 @@ class ZFSBackup(object):
         if debug:
             print("Restoring snapshots {}".format(restore_snaps), file=sys.stderr)
             
+        if restore_snaps:
+            self.prepare_restore(*restore_snaps)
+
         for snap in restore_snaps:
             # Do I need any other options?  Possibliy if doing
             # an interrupted restore.
