@@ -171,15 +171,25 @@ class ZFSBackupError(ValueError):
 
 class ZFSBackupMissingFullBackupError(ZFSBackupError):
     def __init__(self):
-        super(ZFSBackupMissingFullBackupError).__init__(self,
+        super(ZFSBackupMissingFullBackupError, self).__init__(self,
                                                         "No full backup available")
         
 class ZFSBackupSnapshotNotFoundError(ZFSBackupError):
     def __init__(self, snapname):
         self.snapshot_name = snapname
-        super(ZFSBackupSnapshotNotFoundError).__init__(self,
+        super(ZFSBackupSnapshotNotFoundError, self).__init__(self,
                                                        "Specified snapshot {} does not exist".format(snapname))
 
+class ZFSBackupS3StorageClassError(ZFSBackupError):
+    """
+    This exception is raised when data on an S3 backup is not in the right storage
+    class -- that is, when it's in GLACIER, but needs to be accessible.  This can
+    also happen when the data is still in the process of being restored.
+    """
+    def __init__(self, snapname, msg):
+        self.snapshot_name = snapname
+        super(ZFSBackupS3StorageClassError, self).__init__(self, msg)
+        
 class ZFSBackupFilter(object):
     """
     Base class for ZFS backup filters.
@@ -1628,7 +1638,9 @@ class ZFSBackupS3(ZFSBackupDirectory):
         """
         self._map = None
         self._glacier = glacier
-
+        self._access_key = s3_key
+        self._secret_key = s3_secret
+        
         self._s3 = boto3.client('s3', aws_access_key_id=s3_key,
                                 aws_secret_access_key=s3_secret,
                                 endpoint_url=server,
@@ -1866,6 +1878,21 @@ class ZFSBackupS3(ZFSBackupDirectory):
             print("Wrote out {} chunks".format(len(chunks)), file=sys.stderr)
         return chunks
     
+    @property
+    def target_snapshots(self):
+        # This should probably be cached, since it will incur a cost
+        # for each list.
+        snapshots = super(ZFSBackupS3, self).target_snapshots
+        if debug:
+            for snap in snapshots:
+                for chunk in snap["chunks"]:
+                    chunk_head = self.s3.head_object(Bucket=self.bucket, Key=chunk)
+                    print("Snapshot {}, chunk {}: {}".format(snap["Name"],
+                                                                           chunk,
+                                                                           chunk_head),
+                          file=sys.stderr)
+        return snapshots
+    
     def validate(self):
         """
         We don't do a lot of validation, since s3 costs per usage.
@@ -1921,6 +1948,66 @@ class ZFSBackupS3(ZFSBackupDirectory):
             if delta.days > 2:
                 problems.append(("stale_multpart_upload", self.bucket, upload_key, upload_id))
                 
+    def _chunk_available(self, chunk_name, restore_tier=None):
+        try:
+            header = self.s3.head_object(Bucket=self.bucket, Key=chunk_name)
+        except:
+            return False
+        storage_class = header.get("StorageClass", None)
+        # restore_status can be None, or 'ongoing-request="True"', or
+        # some other values.  Which I don't know yet.
+        restore_status = header.get("Restore", None)
+        if storage_class == "GLACIER":
+            if restore_status is None:
+                if restore_tier:
+                    # If we set restore_tier, that means we want to start the restore
+                    self.s3.restore_object(Bucket=self.bucket,
+                                           Key=chunk_name,
+                                           RestoreRequest={ "Days" :  7,
+                                                            "GlacierJobParameters" : {
+                                                                "Tier" : restore_tier,
+                                                            },
+                                           }
+                    )
+                    return False
+                elif restore_status == 'ongoing-request="True"':
+                    return False
+                else:
+                    if verbose:
+                        print("Bucket {}, chunk {}: restore_status = {}".format(self.bucket,
+                                                                                chunk_name,
+                                                                                restore_status),
+                              file=sys.stderr)
+        return True
+    
+    def prepare_restore(self, *args, **kwargs):
+        """
+        Go through all of the snapshots (as args); if a chunk is
+        in GLACIER storage class, and does not have a Restore key,
+        then we start the restore process.  Note that this can take
+        a long time.
+        """
+        dataset = kwargs.get("dataset", self.source)
+        priority = kwargs.get("priority", "low")
+        if "priority" == "high":
+            tier = "Expedited"
+        elif priority == "medium":
+            tier = "Standar"
+        else:
+            tier = "Bulk"
+        try:
+            dataset_snapshots = self.mapfile[dataset]["snapshots"]
+        except KeyError:
+            # Really?  Okay, so let's just return
+            return
+        snapshot_dict = dict((el["Name"], el["chunks"]) for el in dataset_snapshots)
+        for snapshot_name in args:
+            if snapshot_name in snapshot_dict:
+                for chunk_name in snapshot_dict[snapshot_name]:
+                    # We don't care about a return value
+                    self._chunk_available(chunk_name, restore_tier=tier)
+
+                        
 class ZFSBackupSSH(ZFSBackup):
     """
     Replicate to a remote host using ssh.
