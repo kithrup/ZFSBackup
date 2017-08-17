@@ -1955,6 +1955,8 @@ class ZFSBackupS3(ZFSBackupDirectory):
             return False
         storage_class = header.get("StorageClass", None)
         # restore_status can be None, or 'ongoing-request="True"', or
+        # 'ongoing-request="False", expiry-date="${date}"', or possibly
+        # some other value.
         # some other values.  Which I don't know yet.
         restore_status = header.get("Restore", None)
         if storage_class == "GLACIER":
@@ -1970,14 +1972,22 @@ class ZFSBackupS3(ZFSBackupDirectory):
                                            }
                     )
                     return False
-                elif restore_status == 'ongoing-request="True"':
-                    return False
                 else:
-                    if verbose:
-                        print("Bucket {}, chunk {}: restore_status = {}".format(self.bucket,
-                                                                                chunk_name,
-                                                                                restore_status),
-                              file=sys.stderr)
+                    if 'ongoing-request="true"' in restore_status:
+                        # The restore is in progress, but the file is not ready yet
+                        return False
+                    elif 'ongoing-request="false"' in restore_status:
+                        # The file is in glacier, but is available for downloading now
+                        # Isn't this confusing?
+                        return True
+                    else:
+                        # ???
+                        if debug:
+                            print("Bucket {}, chunk {}: restore_status = {}".format(self.bucket,
+                                                                                    chunk_name,
+                                                                                    restore_status),
+                                  file=sys.stderr)
+                        return False
         return True
     
     def prepare_restore(self, *args, **kwargs):
