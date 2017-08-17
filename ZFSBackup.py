@@ -180,6 +180,15 @@ class ZFSBackupSnapshotNotFoundError(ZFSBackupError):
         super(ZFSBackupSnapshotNotFoundError, self).__init__(self,
                                                        "Specified snapshot {} does not exist".format(snapname))
 
+class ZFSBackupChunkUnavailableError(ZFSBackupError):
+    """
+    This exception is raised when a chunk file in a snapshot is missing.
+    """
+    def __init__(self, snapname, chunk_name):
+        self.snapshot_name = snapname
+        super(ZFSBackupChunkMissingError, self).__init__(self,
+                                                         "Chunk file {} unvailable for snapshot {}".format(chunk_name, snapname))
+
 class ZFSBackupS3StorageClassError(ZFSBackupError):
     """
     This exception is raised when data on an S3 backup is not in the right storage
@@ -563,9 +572,9 @@ class ZFSBackupFilterCommand(ZFSBackupFilter):
     def finish(self):
         if debug:
             print("In command filter {}, calling proc.wait".format(self.name), file=sys.stderr)
-        if self.proc.stdin:
-            self.proc.stdin.close()
         if self.proc:
+            if self.proc.stdin:
+                self.proc.stdin.close()
             self.proc.wait()
         if self.error:
             try:
@@ -756,11 +765,11 @@ class ZFSBackup(object):
             input = f.start_backup(input)
         return input
     
-    def _filter_restore(self, destination, error=None):
+    def _filter_restore(self, destination, error=None, use_filters=None):
         # Private method, to stitch the restore filters together.
         # Note that they are in reverse order.
         output = destination
-        for f in reversed(self.filters):
+        for f in reversed(use_filters if use_filters is not None else self.filters):
             f.error_output = error
             if debug:
                 print("Starting restore filter {} ({})".format(f.name, f.restore_command), file=sys.stderr)
@@ -1411,6 +1420,62 @@ class ZFSBackupDirectory(ZFSBackup):
                 if debug:
                     print("Finished writing chunk file {}".format(chunk.name), file=sys.stderr)
         return chunks
+    
+    def restore_handler(self, stream, **kwargs):
+        """
+        Method called to read a snapshot from the target.
+        kwargs contains the snapshot information, most importantly "Name"
+        being the name of the snapshot.
+        All filters are set up here; for ZFSBackupDirectory, we ignore
+        any filters set up by the caller, and only use filters used to
+        create the backup.  (They, too, are in kwargs.  They need to be
+        applied in reverse order.)
+
+        ResumeToken, parents, etc., are all ignored for this class.
+
+        The processs of restoring a snapshot from ZFSBackupDirectory involves
+        ensuring all of the chunks are available, setting up the filters
+        (remember that <stream> is written to by the filters), and then
+        reading each chunk and writing it to the filter object.
+        """
+        snapname = kwargs.get("Name")
+        chunks = kwargs.get("chunks")
+        filters = kwargs.get("filters", [])
+        
+        for chunk in chunks:
+            # Let's make sure they're available
+            if not self._chunk_available(chunk):
+                raise ZFSBackupChunkUnavailableError(snapname, chunk)
+        
+        # Okay, all of the chunks are available.
+        # Let's set up a bunch of command filters
+        restore_filters = []
+        for filter in filters:
+            restore_filters.append(ZFSBackupFilterCommand(backup_command=filter))
+        with tempfile.TemporaryFile() as error_output:
+            fobj = self._filter_restore(stream, error=error_output, use_filters=restore_filters)
+            try:
+                for chunk in chunks:
+                    self._read_chunk(chunk, fobj)
+            except BaseException as e:
+                print("Got exception {} while trying to read chunk {}".format(str(e), chunk), file=sys.stderr)
+            finally:
+                fobj.close()
+
+        return
+    
+    def _read_chunk(self, chunk_name, stream):
+        # Open the chunk, read from it, and write to stream.
+        chunk_path = os.path.join(self.target, chunk_name)
+        mByte = 1024 * 1024
+        with open(chunk_path, "rb") as f:
+            while True:
+                buf = f.read(mByte)
+                if buf:
+                    stream.write(buf)
+                else:
+                    break
+        return
     
     def _chunk_available(self, chunk_name, **kwargs):
         # See if the chunk file exists.
