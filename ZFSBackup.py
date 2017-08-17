@@ -1223,6 +1223,11 @@ class ZFSBackup(object):
                     
                     try:
                         self.restore_handler(recv_proc.stdin, **restore_dict)
+                        recv_proc.wait()
+                        if recv_proc.returncode:
+                            raise ZFSBackuperror("Restore failed with error code {}".format(recv_proc.returncode))
+                        if verbose:
+                            print("Finished with restore for {}".format(restore_dict["Name"]), file=sys.stderr)
                     except ZFSBackupError:
                         recv_proc.wait()
                         if recv_proc.returncode:
