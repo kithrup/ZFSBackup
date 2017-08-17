@@ -1412,6 +1412,11 @@ class ZFSBackupDirectory(ZFSBackup):
                     print("Finished writing chunk file {}".format(chunk.name), file=sys.stderr)
         return chunks
     
+    def _chunk_available(self, chunk_name, **kwargs):
+        # See if the chunk file exists.
+        chunk_path = os.path.join(self.target, chunk_name)
+        return os.path.exists(chunk_path)
+    
     def backup_handler(self, stream, **kwargs):
         # Write the backup to the target.  In our case, we're
         # doing a couple of things:
@@ -1948,11 +1953,16 @@ class ZFSBackupS3(ZFSBackupDirectory):
             if delta.days > 2:
                 problems.append(("stale_multpart_upload", self.bucket, upload_key, upload_id))
                 
-    def _chunk_available(self, chunk_name, restore_tier=None):
+    def _chunk_available(self, chunk_name, **kwargs):
         try:
             header = self.s3.head_object(Bucket=self.bucket, Key=chunk_name)
-        except:
+        except botocore.exceptions.ClientError as e:
+            if debug:
+                print("s3 _chunk_available(Bucket={}, Key={}) got exception {}".format(
+                    self.bucket, chunk_name, str(e)),
+                      file=sys.stderr)
             return False
+        restore_tier = kwargs.get("restore_tier", None)
         storage_class = header.get("StorageClass", None)
         # restore_status can be None, or 'ongoing-request="True"', or
         # 'ongoing-request="False", expiry-date="${date}"', or possibly
@@ -1971,23 +1981,23 @@ class ZFSBackupS3(ZFSBackupDirectory):
                                                             },
                                            }
                     )
+                return False
+            else:
+                if 'ongoing-request="true"' in restore_status:
+                    # The restore is in progress, but the file is not ready yet
                     return False
+                elif 'ongoing-request="false"' in restore_status:
+                    # The file is in glacier, but is available for downloading now
+                    # Isn't this confusing?
+                    return True
                 else:
-                    if 'ongoing-request="true"' in restore_status:
-                        # The restore is in progress, but the file is not ready yet
-                        return False
-                    elif 'ongoing-request="false"' in restore_status:
-                        # The file is in glacier, but is available for downloading now
-                        # Isn't this confusing?
-                        return True
-                    else:
-                        # ???
-                        if debug:
-                            print("Bucket {}, chunk {}: restore_status = {}".format(self.bucket,
-                                                                                    chunk_name,
-                                                                                    restore_status),
-                                  file=sys.stderr)
-                        return False
+                    # ???
+                    if debug:
+                        print("Bucket {}, chunk {}: restore_status = {}".format(self.bucket,
+                                                                                chunk_name,
+                                                                                restore_status),
+                              file=sys.stderr)
+                    return False
         return True
     
     def prepare_restore(self, *args, **kwargs):
@@ -2563,9 +2573,13 @@ def main():
                 for filter in filters:
                     output += "\n\tFilter: {}".format(" ".join(filter))
                 if "chunks" in snapshot:
-                    output += "\n\tChunks:\n"
+                    output += "\n\tChunks:"
                     for chunk in snapshot["chunks"]:
-                        output += "\t\t{}".format(chunk)
+                        output += "\n\t\t{}".format(chunk)
+                        try:
+                            output += " (available)" if backup._chunk_available(chunk) else " (unavailable)"
+                        except AttributeError:
+                            pass
                 for key in snapshot.keys():
                     if key in ("Name", "CreationTime", "incremental",
                                "parent", "chunks", "filters"):
