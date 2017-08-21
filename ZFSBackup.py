@@ -2023,6 +2023,23 @@ class ZFSBackupS3(ZFSBackupDirectory):
             if delta.days > 2:
                 problems.append(("stale_multpart_upload", self.bucket, upload_key, upload_id))
                 
+    def _read_chunk(self, chunk_name, stream):
+        # Open the chunk, read from it, and write to the stream.
+        # In the S3 case, boto takes care of al of that.
+        try:
+            self.s3.download_fileobj(Fileobj=stream,
+                                     Bucket=self.bucket,
+                                     Key=chunk_name)
+        except botocore.exceptions.ClientError as e:
+            # Should check for specific errors here.  One that may happen
+            # and which should be specifically looked for is storage class --
+            # if a chunk is in glacier, or hasn't finished transitioning back
+            # to readable, we should raise a different exception.
+            if verbose:
+                print("Unable to download chunk {} from bucket {}: {}".format(chunk_name, self.bucket, str(e)))
+            raise ZFSBackupError(str(e))
+        return
+    
     def _chunk_available(self, chunk_name, **kwargs):
         try:
             header = self.s3.head_object(Bucket=self.bucket, Key=chunk_name)
@@ -2091,7 +2108,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
             # Really?  Okay, so let's just return
             return
         snapshot_dict = dict((el["Name"], el["chunks"]) for el in dataset_snapshots)
-        for snapshot_name in args:
+        for snapshot_name in [el["Name"] for el in args]:
             if snapshot_name in snapshot_dict:
                 for chunk_name in snapshot_dict[snapshot_name]:
                     # We don't care about a return value
