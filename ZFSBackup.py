@@ -1150,6 +1150,9 @@ class ZFSBackup(object):
         else:
             last_common_snapshot = None
 
+        if debug:
+            print("restore: last_common_snapshot = {}".format(last_common_snapshot), file=sys.stderr)
+            
         # If last_common_snapshot is set, then we need a list of
         # snapshots on the target between last_common_snapshot and
         # snapname; if last_common_snapshot is None, then we
@@ -1225,7 +1228,7 @@ class ZFSBackup(object):
                         self.restore_handler(recv_proc.stdin, **restore_dict)
                         recv_proc.wait()
                         if recv_proc.returncode:
-                            raise ZFSBackuperror("Restore failed with error code {}".format(recv_proc.returncode))
+                            raise ZFSBackupError("Restore failed with error code {}".format(recv_proc.returncode))
                         if verbose:
                             print("Finished with restore for {}".format(restore_dict["Name"]), file=sys.stderr)
                     except ZFSBackupError:
@@ -1394,6 +1397,18 @@ class ZFSBackupDirectory(ZFSBackup):
         else:
             return []
 
+    def _most_recent_full_backup_index(self, snapshots):
+        """
+        Unlike the base class, we have to find the most recent
+        snapshot that isn't an incremental.
+        """
+        if not snapshots:
+            raise ZFSBackupMissingFullBackupError()
+        for indx in range(len(snapshots) - 1, -1, -1):
+            if snapshots[indx].get("incremental", None) is False:
+                return indx
+        raise ZFSBackupMissingFullBackupError()
+    
     def _write_chunks(self, stream):
         chunks = []
         mByte = 1024 * 1024
@@ -1447,6 +1462,8 @@ class ZFSBackupDirectory(ZFSBackup):
         chunks = kwargs.get("chunks")
         filters = kwargs.get("filters", [])
         
+        if debug:
+            print("ZFSBackupDirectory.restore_handler({}, {})".format(stream, kwargs), file=sys.stderr)
         for chunk in chunks:
             # Let's make sure they're available
             if not self._chunk_available(chunk):
