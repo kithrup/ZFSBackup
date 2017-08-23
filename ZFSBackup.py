@@ -194,14 +194,12 @@ class ZFSBackupError(ValueError):
 
 class ZFSBackupMissingFullBackupError(ZFSBackupError):
     def __init__(self):
-        super(ZFSBackupMissingFullBackupError, self).__init__(self,
-                                                        "No full backup available")
+        super(ZFSBackupMissingFullBackupError, self).__init__("No full backup available")
         
 class ZFSBackupSnapshotNotFoundError(ZFSBackupError):
     def __init__(self, snapname):
         self.snapshot_name = snapname
-        super(ZFSBackupSnapshotNotFoundError, self).__init__(self,
-                                                       "Specified snapshot {} does not exist".format(snapname))
+        super(ZFSBackupSnapshotNotFoundError, self).__("Specified snapshot {} does not exist".format(snapname))
 
 class ZFSBackupChunkError(ZFSBackupError):
     """
@@ -211,7 +209,7 @@ class ZFSBackupChunkError(ZFSBackupError):
         self.snapshot_name = snapname
         self.chunk_name = chunkname
         self.message = msg or "Error with chunk file {} for snapshot {}".format(chunkname, snapshot)
-        super(ZFSBackupChunkError, self).__init__(self, self.message)
+        super(ZFSBackupChunkError, self).__init__(self.message)
 
     def __str__(self):
         return "<{} snapshot={}, chunkname={}, message={}>".format(self.__class__.__name__,
@@ -227,7 +225,7 @@ class ZFSBackupChunkMissingError(ZFSBackupChunkError):
     Raised when the specified chunk is missing.
     """
     def __init__(self, snapname, chunkname):
-        super(ZFSBackupChunkMissingError, self).__init__(self, snapname, chunkname,
+        super(ZFSBackupChunkMissingError, self).__init__(snapname, chunkname,
                                                          "Chunk file {} is missing for snapshot {}".format(chunkname, snapname))
 
 class ZFSBackupChunkOfflineError(ZFSBackupChunkError):
@@ -236,16 +234,18 @@ class ZFSBackupChunkOfflineError(ZFSBackupChunkError):
     chunk data to be accessed.  I.e., Glacier storage, with no restore pending.
     """
     def __init__(self, snapname, chunkname):
-        super(ZFSBackupChunkOfflineError, self).__init__(self, snapname, chunkname,
-                                                         "Chunk file {} for snapshot {} is offline".format(chunkname, snapshot))
-
+        super(ZFSBackupChunkOfflineError, self).__init__(snapname,
+                                                         chunkname,
+                                                         "Chunk file {} for snapshot {} is offline".format(chunkname, snapname))
+        return
+    
 class ZFSBackupChunkPendingError(ZFSBackupChunkError):
     """
     Similar to the above, but this is used when the restore has not completed yet.
     This means, "Try again later," really.
     """
     def __init__(self, snapname, chunkname):
-        super(ZFZSBackupChunkPendingError, self).__init__(self, snapname, chunkname,
+        super(ZFSBackupChunkPendingError, self).__init__(snapname, chunkname,
                                                           "Chunk file {} for snapshot {} has not completed transferring".format(chunkname, snapname))
         
 class ZFSBackupFilter(object):
@@ -2117,30 +2117,34 @@ class ZFSBackupS3(ZFSBackupDirectory):
         try:
             header = self.s3.head_object(Bucket=self.bucket, Key=chunk_name)
         except botocore.exceptions.ClientError as e:
-            if debug:
+            if verbose:
                 print("s3 _chunk_available(Bucket={}, Key={}) got exception {}".format(
                     self.bucket, chunk_name, str(e)),
                       file=sys.stderr)
             return ChunkStatus.Missing
-        restore_priority = kwargs.get("restore_tier", None)
+        restore_priority = kwargs.get("restore_priority", None)
         storage_class = header.get("StorageClass", None)
         # restore_status can be None, or 'ongoing-request="True"', or
         # 'ongoing-request="False", expiry-date="${date}"', or possibly
         # some other value.
         # some other values.  Which I don't know yet.
         restore_status = header.get("Restore", None)
+        print("Storage class = {}, restore_status = {}, restore_priority = {}".format(storage_class, restore_status, restore_priority), file=sys.stderr)
         if storage_class == "GLACIER":
             if restore_status is None:
                 if restore_priority:
                     # If we set restore_tier, that means we want to start the restore
-                    self.s3.restore_object(Bucket=self.bucket,
-                                           Key=chunk_name,
-                                           RestoreRequest={ "Days" :  7,
-                                                            "GlacierJobParameters" : {
-                                                                "Tier" : restore_priority,
-                                                            },
-                                           }
-                    )
+                    try:
+                        self.s3.restore_object(Bucket=self.bucket,
+                                               Key=chunk_name,
+                                               RestoreRequest={ "Days" :  7,
+                                                                "GlacierJobParameters" : {
+                                                                    "Tier" : restore_priority,
+                                                                },
+                                               }
+                        )
+                    except botocore.exceptions.ClientError as e:
+                        print("Got exception {} while trying to start restore".format(str(e)), file=sys.stderr)
                 return ChunkStatus.Offline
             else:
                 if 'ongoing-request="true"' in restore_status:
@@ -2179,9 +2183,9 @@ class ZFSBackupS3(ZFSBackupDirectory):
         for snapshot_name in [el["Name"] for el in args]:
             if snapshot_name in snapshot_dict:
                 for chunk_name in snapshot_dict[snapshot_name]:
-                    # We don't care about a return value
-                    self._chunk_status(chunk_name, restore_priority=priority.value)
-
+                    status = self._chunk_status(chunk_name, restore_priority=priority.value)
+                    if verbose:
+                        print("Chunk {} has status {}".format(chunk_name, status), file=sys.stderr)
                         
 class ZFSBackupSSH(ZFSBackup):
     """
