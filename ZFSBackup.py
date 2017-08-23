@@ -10,7 +10,8 @@ import errno
 import boto3
 import botocore
 import socket
-        
+from enum import Enum
+
 if sys.version_info[0] == 2:
     from pipes import quote as SHELL_QUOTE
 elif sys.version_info[0] == 3:
@@ -163,6 +164,19 @@ def _get_snapshots(ds):
             d["ResumeToken"] = resume_token
         snapshots.append(d)
     return snapshots
+
+class ChunkStatus(Enum):
+    """
+    For classes which use chunks (e.g., ZFSBackupDirectory),
+    this status indicates whether a chunk is ready or not to use.
+    Offline and Transferring are S3-specific, and indicate that the
+    chunk is in glacier, and transferring from glacier, respectively.
+    """
+    Available = "Available"
+    Missing = "Missing"
+    Error = "Error"
+    Offline = "Offline"
+    Transferring = "Transferring"
 
 class ZFSBackupError(ValueError):
     def __init__(self, message):
@@ -1499,10 +1513,10 @@ class ZFSBackupDirectory(ZFSBackup):
                     break
         return
     
-    def _chunk_available(self, chunk_name, **kwargs):
+    def _chunk_status(self, chunk_name, **kwargs):
         # See if the chunk file exists.
         chunk_path = os.path.join(self.target, chunk_name)
-        return os.path.exists(chunk_path)
+        return ChunkStatus.Available if os.path.exists(chunk_path) else ChunkStatus.Missing
     
     def backup_handler(self, stream, **kwargs):
         # Write the backup to the target.  In our case, we're
@@ -2057,7 +2071,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
             raise ZFSBackupError(str(e))
         return
     
-    def _chunk_available(self, chunk_name, **kwargs):
+    def _chunk_status(self, chunk_name, **kwargs):
         try:
             header = self.s3.head_object(Bucket=self.bucket, Key=chunk_name)
         except botocore.exceptions.ClientError as e:
@@ -2065,7 +2079,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
                 print("s3 _chunk_available(Bucket={}, Key={}) got exception {}".format(
                     self.bucket, chunk_name, str(e)),
                       file=sys.stderr)
-            return False
+            return ChunkStatus.Missing
         restore_tier = kwargs.get("restore_tier", None)
         storage_class = header.get("StorageClass", None)
         # restore_status can be None, or 'ongoing-request="True"', or
@@ -2085,15 +2099,15 @@ class ZFSBackupS3(ZFSBackupDirectory):
                                                             },
                                            }
                     )
-                return False
+                return ChunkStatus.Offline
             else:
                 if 'ongoing-request="true"' in restore_status:
                     # The restore is in progress, but the file is not ready yet
-                    return False
+                    return ChunkStatus.Transferring
                 elif 'ongoing-request="false"' in restore_status:
                     # The file is in glacier, but is available for downloading now
                     # Isn't this confusing?
-                    return True
+                    return ChunkStatus.Available
                 else:
                     # ???
                     if debug:
@@ -2101,8 +2115,8 @@ class ZFSBackupS3(ZFSBackupDirectory):
                                                                                 chunk_name,
                                                                                 restore_status),
                               file=sys.stderr)
-                    return False
-        return True
+                    return ChunkStatus.Error
+        return ChunkStatus.Available
     
     def prepare_restore(self, *args, **kwargs):
         """
@@ -2129,7 +2143,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
             if snapshot_name in snapshot_dict:
                 for chunk_name in snapshot_dict[snapshot_name]:
                     # We don't care about a return value
-                    self._chunk_available(chunk_name, restore_tier=tier)
+                    self._chunk_status(chunk_name, restore_tier=tier)
 
                         
 class ZFSBackupSSH(ZFSBackup):
@@ -2681,7 +2695,7 @@ def main():
                     for chunk in snapshot["chunks"]:
                         output += "\n\t\t{}".format(chunk)
                         try:
-                            output += " (available)" if backup._chunk_available(chunk) else " (unavailable)"
+                            output += " ({})".format(backup._chunk_status(chunk).value)
                         except AttributeError:
                             pass
                 for key in snapshot.keys():
