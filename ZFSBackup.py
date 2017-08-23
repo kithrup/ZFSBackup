@@ -203,24 +203,50 @@ class ZFSBackupSnapshotNotFoundError(ZFSBackupError):
         super(ZFSBackupSnapshotNotFoundError, self).__init__(self,
                                                        "Specified snapshot {} does not exist".format(snapname))
 
-class ZFSBackupChunkUnavailableError(ZFSBackupError):
+class ZFSBackupChunkError(ZFSBackupError):
     """
-    This exception is raised when a chunk file in a snapshot is missing.
+    Base class for exceptions related to chunks.
     """
-    def __init__(self, snapname, chunk_name):
+    def __init__(self, snapname, chunkname, msg=None):
         self.snapshot_name = snapname
-        super(ZFSBackupChunkMissingError, self).__init__(self,
-                                                         "Chunk file {} unvailable for snapshot {}".format(chunk_name, snapname))
+        self.chunk_name = chunkname
+        self.message = msg or "Error with chunk file {} for snapshot {}".format(chunkname, snapshot)
+        super(ZFSBackupChunkError, self).__init__(self, self.message)
 
-class ZFSBackupS3StorageClassError(ZFSBackupError):
+    def __str__(self):
+        return "<{} snapshot={}, chunkname={}, message={}>".format(self.__class__.__name__,
+                                                              self.snapshot_name,
+                                                              self.chunkname)
+
+    def __repr__(self):
+        return "{}(snapname={}, chunkname={}, msg={})".format(self.__class__.__name__,
+                                                              self.snapshot_name,
+                                                              self.chunkname)
+class ZFSBackupChunkMissingError(ZFSBackupChunkError):
     """
-    This exception is raised when data on an S3 backup is not in the right storage
-    class -- that is, when it's in GLACIER, but needs to be accessible.  This can
-    also happen when the data is still in the process of being restored.
+    Raised when the specified chunk is missing.
     """
-    def __init__(self, snapname, msg):
-        self.snapshot_name = snapname
-        super(ZFSBackupS3StorageClassError, self).__init__(self, msg)
+    def __init__(self, snapname, chunkname):
+        super(ZFSBackupChunkMissingError, self).__init__(self, snapname, chunkname,
+                                                         "Chunk file {} is missing for snapshot {}".format(chunkname, snapname))
+
+class ZFSBackupChunkOfflineError(ZFSBackupChunkError):
+    """
+    Currently only used with S3: this indicates that the storage class won't allow the
+    chunk data to be accessed.  I.e., Glacier storage, with no restore pending.
+    """
+    def __init__(self, snapname, chunkname):
+        super(ZFSBackupChunkOfflineError, self).__init__(self, snapname, chunkname,
+                                                         "Chunk file {} for snapshot {} is offline".format(chunkname, snapshot))
+
+class ZFSBackupChunkPendingError(ZFSBackupChunkError):
+    """
+    Similar to the above, but this is used when the restore has not completed yet.
+    This means, "Try again later," really.
+    """
+    def __init__(self, snapname, chunkname):
+        super(ZFZSBackupChunkPendingError, self).__init__(self, snapname, chunkname,
+                                                          "Chunk file {} for snapshot {} has not completed transferring".format(chunkname, snapname))
         
 class ZFSBackupFilter(object):
     """
@@ -1489,8 +1515,15 @@ class ZFSBackupDirectory(ZFSBackup):
             print("ZFSBackupDirectory.restore_handler({}, {})".format(stream, kwargs), file=sys.stderr)
         for chunk in chunks:
             # Let's make sure they're available
-            if not self._chunk_available(chunk):
-                raise ZFSBackupChunkUnavailableError(snapname, chunk)
+            status = self._chunk_status(chunk)
+            if status == ChunkStatus.Missing:
+                raise ZFSBackupChunkMissingError(snapname, chunk)
+            elif status == ChunkStatus.Offline:
+                raise ZFSBackupChunkOffineError(snapname, chunk)
+            elif status == ChunkStatus.Transferring:
+                raise ZFSBackupChunkPendingError(snapname, chunk)
+            elif status != ChunkStatus.Available:
+                raise ZFSBackupChunkError(snapname, chunk, "Unknown error for chunk {} in snapshot {}".format(chunk, snapname))
         
         # Okay, all of the chunks are available.
         # Let's set up a bunch of command filters
