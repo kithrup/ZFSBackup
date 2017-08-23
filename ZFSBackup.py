@@ -213,13 +213,15 @@ class ZFSBackupChunkError(ZFSBackupError):
 
     def __str__(self):
         return "<{} snapshot={}, chunkname={}, message={}>".format(self.__class__.__name__,
-                                                              self.snapshot_name,
-                                                              self.chunkname)
+                                                                   self.snapshot_name,
+                                                                   self.chunk_name,
+                                                                   self.message)
 
     def __repr__(self):
         return "{}(snapname={}, chunkname={}, msg={})".format(self.__class__.__name__,
                                                               self.snapshot_name,
-                                                              self.chunkname)
+                                                              self.chunk_name,
+                                                              self.message)
 class ZFSBackupChunkMissingError(ZFSBackupChunkError):
     """
     Raised when the specified chunk is missing.
@@ -1281,6 +1283,8 @@ class ZFSBackup(object):
                         if verbose:
                             print("Finished with restore for {}".format(restore_dict["Name"]), file=sys.stderr)
                     except ZFSBackupError as e:
+                        if verbose:
+                            print("Got exception {}".format(str(e)), file=sys.stderr)
                         # We may need to close the stdin so it dies.
                         if recv_proc and recv_proc.stdin:
                             recv_proc.stdin.close()
