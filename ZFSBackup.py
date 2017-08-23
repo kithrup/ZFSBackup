@@ -1519,7 +1519,7 @@ class ZFSBackupDirectory(ZFSBackup):
             if status == ChunkStatus.Missing:
                 raise ZFSBackupChunkMissingError(snapname, chunk)
             elif status == ChunkStatus.Offline:
-                raise ZFSBackupChunkOffineError(snapname, chunk)
+                raise ZFSBackupChunkOfflineError(snapname, chunk)
             elif status == ChunkStatus.Transferring:
                 raise ZFSBackupChunkPendingError(snapname, chunk)
             elif status != ChunkStatus.Available:
