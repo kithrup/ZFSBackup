@@ -165,6 +165,15 @@ def _get_snapshots(ds):
         snapshots.append(d)
     return snapshots
 
+class ChunkRestorePriority(Enum):
+    """
+    When restoring a chunk from glacier, which priority to
+    use.
+    """
+    High = "Expedited"
+    Medium = "Standard"
+    Low = "Bulk"
+    
 class ChunkStatus(Enum):
     """
     For classes which use chunks (e.g., ZFSBackupDirectory),
@@ -2080,7 +2089,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
                     self.bucket, chunk_name, str(e)),
                       file=sys.stderr)
             return ChunkStatus.Missing
-        restore_tier = kwargs.get("restore_tier", None)
+        restore_priority = kwargs.get("restore_tier", None)
         storage_class = header.get("StorageClass", None)
         # restore_status can be None, or 'ongoing-request="True"', or
         # 'ongoing-request="False", expiry-date="${date}"', or possibly
@@ -2089,13 +2098,13 @@ class ZFSBackupS3(ZFSBackupDirectory):
         restore_status = header.get("Restore", None)
         if storage_class == "GLACIER":
             if restore_status is None:
-                if restore_tier:
+                if restore_priority:
                     # If we set restore_tier, that means we want to start the restore
                     self.s3.restore_object(Bucket=self.bucket,
                                            Key=chunk_name,
                                            RestoreRequest={ "Days" :  7,
                                                             "GlacierJobParameters" : {
-                                                                "Tier" : restore_tier,
+                                                                "Tier" : restore_priority,
                                                             },
                                            }
                     )
@@ -2126,13 +2135,8 @@ class ZFSBackupS3(ZFSBackupDirectory):
         a long time.
         """
         dataset = kwargs.get("dataset", self.source)
-        priority = kwargs.get("priority", "low")
-        if "priority" == "high":
-            tier = "Expedited"
-        elif priority == "medium":
-            tier = "Standar"
-        else:
-            tier = "Bulk"
+        priority = kwargs.get("priority", ChunkRestorePriority.Low)
+
         try:
             dataset_snapshots = self.mapfile[dataset]["snapshots"]
         except KeyError:
@@ -2143,7 +2147,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
             if snapshot_name in snapshot_dict:
                 for chunk_name in snapshot_dict[snapshot_name]:
                     # We don't care about a return value
-                    self._chunk_status(chunk_name, restore_tier=tier)
+                    self._chunk_status(chunk_name, restore_priority=priority.value)
 
                         
 class ZFSBackupSSH(ZFSBackup):
