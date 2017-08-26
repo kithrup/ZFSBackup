@@ -192,6 +192,10 @@ class ZFSBackupError(ValueError):
         self.message = message
         super(ZFSBackupError, self).__init__(message)
 
+class ZFSBackupNotImplementedError(ZFSBackupError):
+    def __init__(self, message):
+        super(ZFSBackupNotImplementedError, self).__init__(message)
+        
 class ZFSBackupMissingFullBackupError(ZFSBackupError):
     def __init__(self):
         super(ZFSBackupMissingFullBackupError, self).__init__("No full backup available")
@@ -789,6 +793,20 @@ class ZFSBackup(object):
     def recursive(self, b):
         self._recursive = b
         
+    def delete(self, *args, **kwargs):
+        """
+        Delete a snapshot, or set of snapshots (in *args).
+        This isn't implemented in the base class, since snapshots
+        can be automatically deleted as part of the replication process.
+        Classes which do backups some other method (e.g., ZFSBackupDirectory)
+        may need this.
+
+        In general, this method is to be used to clean up old snapshots;
+        it'll need to handle dependencies (that is, ensure that any incrementals
+        still have their parents, or that they're all deleted).
+        """
+        raise ZFSBackupNotImplementedError("delete not implemented in class {}".format(self.__class__.__name__))
+    
     def AddFilter(self, filter):
         """
         Add a filter.  The filter is set up during the backup and
