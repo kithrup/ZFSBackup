@@ -5,6 +5,7 @@ import subprocess
 import time
 import tempfile
 import threading
+from select import select
 from io import BytesIO
 import errno
 import boto3
@@ -254,16 +255,273 @@ class ZFSBackupChunkPendingError(ZFSBackupChunkError):
         super(ZFSBackupChunkPendingError, self).__init__(snapname, chunkname,
                                                           "Chunk file {} for snapshot {} has not completed transferring".format(chunkname, snapname))
         
+class ZFSProcess(object):
+    """
+    This is the base class for running subprocesses as part of the
+    backup or restore process.  It works with the ZFSBackup
+    object, for coordiantion, error reporting, and termination.
+
+    A ZFSProcess may be implemented using a subprocess (using Popen,
+    since it is expected to be part of the pipeline), or via threads.
+    
+    It must implement start, stop, and wait methods.  (wait must be
+    invokable multiple times; if the process has finished, it will
+    return or raise an exception if it finished with error.  Being
+    forcibly stopped does not count as an error.  stop will do its
+    best to wait for it take effect, but wait() is the only method to
+    guarantee it.)
+
+    After calling start, the stdin, stdout, and stderr  objects must be
+    accessible as file-like objects.  They may be None.
+
+    It must inform the ZFSBackup object of exit, including an exception
+    if that occurred, via zfsbackup.HelperFinished(self, exc).  (Setting
+    exc to None if there was no error.)
+    """
+    def __init__(self, name, zfsbackup, stdin=None, stdout=None, stderr=None):
+        # Quick sanity checks
+        if zfsbackup is None:
+            raise ValueError("ZFSBackup Object must be set")
+        if stdin is None and stdout is None:
+            raise ValueError("At least one of stdin and stdout must be defined")
+        self._backup_object = zfsbackup
+        self._name = name
+        self._stdin = stdin
+        self._stdout = stdout
+        self._stderr = stderr
+        # Set up various control-related instance variables
+        self._thread = None
+        self._started = threading.Event()
+        self._exited = threading.Event()
+        self._exception = None
+        self._stop = False
+        return
+    
+    @property
+    def name(self):
+        return self._name
+    @property
+    def backup_object(self):
+        return self._backup_object
+    @property
+    def stdin(self):
+        return self._stdin
+    @property
+    def stdout(self):
+        return self._stdout
+    @property
+    def stderr(self):
+        return self._stderr
+    
+    def _run(self):
+        raise NotImplementedError("Base class does not implement run method")
+    
+    def start(self):
+        """
+        Common code to start the thread; subclasses need to implement _run, and
+        do any setup in their implementation of start().
+        """
+        self._thread = threading.Thread(target=self._run)
+        self._thread.run()
+        self._started.wait()
+        return
+    
+    def stop(self):
+        raise NotImplementedError("Base class does not implement stop method")
+    def wait(self):
+        raise NotImplementedError("Base class does not implement wait method")
+    
+class ZFSProcessThread(ZFSProcess):
+    """
+    Implement a ZSFSProcess as a thread -- instead of fork/execing, we'll
+    just create a thread, which will do the work.  All of the constraints and
+    requirements mentioned in the base class apply.
+    One additional requirement:  since threads cannot be sent a signal,
+    the processing code MUST check for a stop request within a reasonable time
+    frame.  This means using select for reading and writing, with a small timeout
+    to check for the stop signal.
+    
+    The processing code can be passed in as target, or a subclass can implement
+    its own _process method.
+    """
+    def __init__(self, name, zfsbackup, target=None,
+                 stdin=None, stdout=None, stderr=None):
+        super(ZFSProcessThread, self).__init__(name, zfsbackup,
+                                               stdin=stdin,
+                                               stdout=stdout,
+                                               stderr=stderr)
+        if target and not callable(target):
+            raise ValueError("Thread target must be callable")
+        self._target = target
+        self._to_close = []
+        
+    def _process(self, buffer):
+        """
+        The base class version of _process simply returns buffer.
+        Subclasses should override this.
+        """
+        return
+    
+    def _run(self):
+        """
+        The init method will have errore out if both stdin and stdout
+        are not set.  So we can create pipes here for them.  When we
+        create a pipe, we need to set both ends to non-blocking and
+        close-on-exec; we also need to keep track of them so we can
+        close the appropriate end (write-side for stdin, read-side
+        for stdout) when we are finished.
+        If stderr is None, we'll set it to /dev/null, and add it to
+        the list for closing.
+        """
+        if self.stdin is None:
+            # Okay, we need to make a pipe for this.  We want to set
+            # self.stdin to an fdopen of the write side, and set the
+            # read side to be closed when we're done.
+            read_side, write_side = os.pipe()
+            for f in [read_side, write_side]:
+                fl = fcntl.fcntl(f, fcntl.F_GETFL)
+                fcntl.fcntl(f, fcntl.F_SETFL, fl | os.O_NONBLOCK | fcntl.FD_CLOEXEC)
+            self._to_close.append(read_side)
+            self.stdin = os.fdopen(write_side, "wb")
+        if self.stdout is None:
+            # We make a pipe for this one.  We want to set
+            # self.stdout to an fdopen of the read side, and set the
+            # write side to be closed when we're done.
+            read_side, write_side = os.pipe()
+            for f in [read_side, write_side]:
+                fl = fcntl.fcntl(f, fcntl.F_GETFL)
+                fcntl.fcntl(f, fcntl.F_SETFL, fl | os.O_NONBLOCK | fcntl.FD_CLOEXEC)
+            self._to_close.append(write_side)
+            self.stdin = os.fdopen(read_side, "rb")
+        if self.stderr is None:
+            self.stderr = open("/dev/null", "wb")
+            self._to_close.append(self.stderr.fileno())
+            
+        # Inform the main thread we've started.
+        self._started.set()
+        mByte = 1024 * 1024
+        try:
+            def doWrite(buffer):
+                """
+                Write out to self.stdout, making sure to write out the whole
+                buffer, and stop when required
+                """
+                nwritten = 0
+                while nwritten < len(buffer):
+                    _, w, _ = select([], [self.stdout], [], 0.1)
+                    if self._stop:
+                        return
+                    if w:
+                        nwritten += os.write(self.stdout.fileno(), buffer[nwritten:])
+                return
+            while True:
+                r, _, _ = select([self.stdin], [], [], 0.1)
+                if self._stop:
+                    break
+                if r:
+                    # Great, we have input ready. Or eof.
+                    print("Thread {}:  select returned r = {}".format(self.name, r), file=sys.stderr)
+                    b = self.stdin.read(mByte)
+                    if not b:
+                        # EOF
+                        print("Thread {}, got EOF on input".format(self.name), file=sys.stderr)
+                        break
+                    else:
+                        temp_buf = (self._target if callable(self._target) else self._process)(b)
+                        # Great, we have data we want to write out
+                        doWrite(temp_buf)
+                if self._stop:
+                    break
+            self._exception = None
+        except BaseException as e:
+            # Deliberately catching all exceptions
+            self._exception = None if self._stop else e
+        self.backup_object.HelperFinished(self, exc=self._exception)
+        # Now close the files in _to_close:
+        for f in self._to_close:
+            try:
+                os.close(f)
+            except OSError:
+                pass
+        self._to_close = []
+        self._exited.set()
+        
+    def stop(self):
+        self._stop = True
+        self._exited.wait()
+
+    def wait(self):
+        if self._exited.isSet() is False:
+            self._exited.wait()
+        if self._exception:
+            raise self._exception
+        
+class ZFSProcessCommand(ZFSProcess):
+    """
+    Implement a ZFSProcess as a command -- that is, it will use a subprocess,
+    specifically Popen.  The process is run in a separate thread.  The command
+    is not started until the start method is invoked.  For the initializer,
+    if any of stdin, stdout, stderr is None, it will be replaced by subprocess.PIPE.
+    """
+    def __init__(self, name, zfsbackup, command,
+                 stdin=None, stdout=None, stderr=None):
+        super(ZFSProcessCommand, self).__init__(name, zfsbackup, stdin, stdout, stderr)
+        # Copy it
+        self._command = command[:]
+        
+    @property
+    def command(self):
+        return self._command
+    
+    def _run(self):
+        """
+        Invoked as part of the thread handler.
+        """
+        try:
+            self._proc = POPEN(self.command,
+                               stdin=subprocess.PIPE if self.stdin is None else self.stdin,
+                               stdout=subprocess.PIPE if self.stdout is None else self.stdout,
+                               stderr=subprocess.PIPE if self.stderr is None else self.stderr)
+            self._stdin = self._proc.stdin
+            self._stdout = self._proc.stdout
+            self._stderr = self._proc.stderr
+            self._started.set()
+            self._proc.wait()
+            
+        except (OSError, ValueError) as e:
+            self._started.set()
+            self._exception = None if self._stop else e
+            self.backup_object.HelperFinished(self, exc=self._exception)
+        finally:
+            self._exited.set()
+            
+    def start(self):
+        """
+        Starts the command im a separate thread.
+        We do setup here, and let the base class go from there.
+        """
+        self._proc = None
+        super(ZFSProcessCommand, self).start()
+        return
+
+    def stop(self):
+        if self._proc:
+            self._stop = True
+            self._proc.terminate()
+            
+    def wait(self):
+        if self._proc:
+            self._proc.wait()
+            if self._exception:
+                raise self._exception
+            
 class ZFSBackupFilter(object):
     """
     Base class for ZFS backup filters.
-    Filters have several properties, and
-    start_backup() and start_restore() methods.
-    The start_* methods take a source, which
-    should be a pipe.  In general, the filters
-    should use a subprocess or thread, unless they
-    are the terminus of the pipeline.  (Doing otherwise
-    risks deadlock.)
+    Filters have several properties, and start_backup() and start_restore()
+    methods. The start_* methods take a source, which should be a pipe.
+    In general, the filters should use a subprocess or thread, unless
+    they are the terminus of the pipeline.  (Doing otherwise risks deadlock.)
     
     The transformative property indicates that the filter transforms
     the data as it processes it.  Some filters don't -- the counter
@@ -768,7 +1026,10 @@ class ZFSBackup(object):
         self._target_snapshots = None
         self._filters = []
         self.validate()
-
+        self._helper_status = []
+        self._helper_lock = threading.Lock()
+        self._helper_done = threading.Event()
+        
     @property
     def target(self):
         return self._dest
@@ -807,6 +1068,14 @@ class ZFSBackup(object):
         """
         raise ZFSBackupNotImplementedError("delete not implemented in class {}".format(self.__class__.__name__))
     
+    def HelperFinished(self, which, exc=None):
+        # Append the helper object / exception pair to the status list.
+        self._helper_lock.acquire()
+        self._helper_status.append(( which, exc))
+        self._helper_lock.release()
+        # Notify the main thread that we've updated it.
+        self._helper_done.set()
+        
     def AddFilter(self, filter):
         """
         Add a filter.  The filter is set up during the backup and
