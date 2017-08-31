@@ -478,6 +478,7 @@ class ZFSProcessCommand(ZFSProcess):
         Invoked as part of the thread handler.
         """
         try:
+            # Should I actually just use CHECK_CALL instead?
             self._proc = POPEN(self.command,
                                stdin=subprocess.PIPE if self.stdin is None else self.stdin,
                                stdout=subprocess.PIPE if self.stdout is None else self.stdout,
@@ -487,8 +488,9 @@ class ZFSProcessCommand(ZFSProcess):
             self._stderr = self._proc.stderr
             self._started.set()
             self._proc.wait()
-            
-        except (OSError, ValueError) as e:
+            if self._proc.returncode != 0:
+                raise subprocess.CalledProcessError(self._proc.returncode, " ".join(self.command))
+        except (OSError, ValueError, subprocess.CalledProcessError) as e:
             self._started.set()
             self._exception = None if self._stop else e
             self.backup_object.HelperFinished(self, exc=self._exception)
