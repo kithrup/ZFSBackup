@@ -306,6 +306,7 @@ class ZFSProcess(object):
     @property
     def stdin(self):
         return self._stdin
+    @stdin.setter
     @property
     def stdout(self):
         return self._stdout
@@ -381,8 +382,11 @@ class ZFSProcessThread(ZFSProcess):
             for f in [read_side, write_side]:
                 fl = fcntl.fcntl(f, fcntl.F_GETFL)
                 fcntl.fcntl(f, fcntl.F_SETFL, fl | os.O_NONBLOCK | fcntl.FD_CLOEXEC)
-            self._to_close.append(read_side)
-            self.stdin = os.fdopen(write_side, "wb")
+            self._stdin = os.fdopen(write_side, "wb")
+            read_from = os.fdopen(read_side, "rb")
+            self._to_close.append(read_from)
+        else:
+            read_from = self.stdin
         if self.stdout is None:
             # We make a pipe for this one.  We want to set
             # self.stdout to an fdopen of the read side, and set the
@@ -391,8 +395,11 @@ class ZFSProcessThread(ZFSProcess):
             for f in [read_side, write_side]:
                 fl = fcntl.fcntl(f, fcntl.F_GETFL)
                 fcntl.fcntl(f, fcntl.F_SETFL, fl | os.O_NONBLOCK | fcntl.FD_CLOEXEC)
-            self._to_close.append(write_side)
-            self.stdin = os.fdopen(read_side, "rb")
+            self._stdout = os.fdopen(read_side, "rb")
+            write_to = os.fdopen(write_side, "wb")
+            self._to_close.append(write_to)
+        else:
+            write_to = self.stdout
         if self.stderr is None:
             self.stderr = open("/dev/null", "wb")
             self._to_close.append(self.stderr)
@@ -404,27 +411,32 @@ class ZFSProcessThread(ZFSProcess):
             def doWrite(buffer):
                 """
                 Write out to self.stdout, making sure to write out the whole
-                buffer, and stop when required
+                buffer, and stop when required.  In its own nested function
+                simply to make the main loop easier to read.
                 """
                 nwritten = 0
                 while nwritten < len(buffer):
-                    _, w, _ = select([], [self.stdout], [], 0.1)
+                    _, w, _ = select([], [write_to], [], 0.1)
                     if self._stop:
                         return
                     if w:
-                        nwritten += os.write(self.stdout.fileno(), buffer[nwritten:])
+                        # We use os.write() because it will tell us how many
+                        # bytes were written, which is important if there's
+                        # a full pipe.
+                        nwritten += os.write(write_to.fileno(), buffer[nwritten:])
+                    if self._stop:
+                        return
                 return
+
             while True:
-                r, _, _ = select([self.stdin], [], [], 0.1)
+                r, _, _ = select([read_from], [], [], 0.1)
                 if self._stop:
                     break
                 if r:
                     # Great, we have input ready. Or eof.
-                    print("Thread {}:  select returned r = {}".format(self.name, r), file=sys.stderr)
-                    b = self.stdin.read(mByte)
+                    b = read_from.read(mByte)
                     if not b:
                         # EOF
-                        print("Thread {}, got EOF on input".format(self.name), file=sys.stderr)
                         break
                     else:
                         temp_buf = (self._target if callable(self._target) else self._process)(b)
@@ -446,9 +458,9 @@ class ZFSProcessThread(ZFSProcess):
                     f.close()
             except OSError:
                 pass
-        self.stdin = None
-        self.stdout = None
-        self.stderr = None
+        self._stdin = None
+        self._stdout = None
+        self._stderr = None
         self._to_close = []
         self._exited.set()
         
