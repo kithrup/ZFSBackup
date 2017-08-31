@@ -391,7 +391,7 @@ class ZFSProcessThread(ZFSProcess):
             self.stdin = os.fdopen(read_side, "rb")
         if self.stderr is None:
             self.stderr = open("/dev/null", "wb")
-            self._to_close.append(self.stderr.fileno())
+            self._to_close.append(self.stderr)
             
         # Inform the main thread we've started.
         self._started.set()
@@ -436,9 +436,15 @@ class ZFSProcessThread(ZFSProcess):
         # Now close the files in _to_close:
         for f in self._to_close:
             try:
-                os.close(f)
+                if type(f) == int:
+                    os.close(f)
+                else:
+                    f.close()
             except OSError:
                 pass
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
         self._to_close = []
         self._exited.set()
         
