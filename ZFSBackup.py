@@ -307,13 +307,21 @@ class ZFSProcess(object):
     def stdin(self):
         return self._stdin
     @stdin.setter
+    def stdin(self, stream):
+        self._stdin = stream
     @property
     def stdout(self):
         return self._stdout
+    @stdout.setter
+    def stdout(self, stream):
+        self._stdout = stream
     @property
     def stderr(self):
         return self._stderr
-    
+    @stdout.setter
+    def stderr(self, stream):
+        self._stderr = stream
+        
     def _run(self):
         raise NotImplementedError("Base class does not implement run method")
     
@@ -382,7 +390,7 @@ class ZFSProcessThread(ZFSProcess):
             for f in [read_side, write_side]:
                 fl = fcntl.fcntl(f, fcntl.F_GETFL)
                 fcntl.fcntl(f, fcntl.F_SETFL, fl | os.O_NONBLOCK | fcntl.FD_CLOEXEC)
-            self._stdin = os.fdopen(write_side, "wb")
+            self.stdin = os.fdopen(write_side, "wb")
             read_from = os.fdopen(read_side, "rb")
             self._to_close.append(read_from)
         else:
@@ -395,7 +403,7 @@ class ZFSProcessThread(ZFSProcess):
             for f in [read_side, write_side]:
                 fl = fcntl.fcntl(f, fcntl.F_GETFL)
                 fcntl.fcntl(f, fcntl.F_SETFL, fl | os.O_NONBLOCK | fcntl.FD_CLOEXEC)
-            self._stdout = os.fdopen(read_side, "rb")
+            self.stdout = os.fdopen(read_side, "rb")
             write_to = os.fdopen(write_side, "wb")
             self._to_close.append(write_to)
         else:
@@ -458,9 +466,9 @@ class ZFSProcessThread(ZFSProcess):
                     f.close()
             except OSError:
                 pass
-        self._stdin = None
-        self._stdout = None
-        self._stderr = None
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
         self._to_close = []
         self._exited.set()
         
@@ -497,13 +505,15 @@ class ZFSProcessCommand(ZFSProcess):
         """
         try:
             # Should I actually just use CHECK_CALL instead?
+            # I'd have to set up the pipes for that; but that
+            # could also be done in shared code at that point.
             self._proc = POPEN(self.command,
                                stdin=subprocess.PIPE if self.stdin is None else self.stdin,
                                stdout=subprocess.PIPE if self.stdout is None else self.stdout,
                                stderr=subprocess.PIPE if self.stderr is None else self.stderr)
-            self._stdin = self._proc.stdin
-            self._stdout = self._proc.stdout
-            self._stderr = self._proc.stderr
+            self.stdin = self._proc.stdin
+            self.stdout = self._proc.stdout
+            self.stderr = self._proc.stderr
             self._started.set()
             self._proc.wait()
             if self._proc.returncode != 0:
