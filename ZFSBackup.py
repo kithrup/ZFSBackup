@@ -278,13 +278,13 @@ class ZFSProcess(object):
     if that occurred, via zfsbackup.HelperFinished(self, exc).  (Setting
     exc to None if there was no error.)
     """
-    def __init__(self, name, zfsbackup, stdin=None, stdout=None, stderr=None):
+    def __init__(self, name, handler, stdin=None, stdout=None, stderr=None):
         # Quick sanity checks
-        if zfsbackup is None:
-            raise ValueError("ZFSBackup Object must be set")
+        if handler is None:
+            raise ValueError("handler must be set")
         if stdin is None and stdout is None:
             raise ValueError("At least one of stdin and stdout must be defined")
-        self._backup_object = zfsbackup
+        self._handler = handler
         self._name = name
         self._stdin = stdin
         self._stdout = stdout
@@ -301,8 +301,8 @@ class ZFSProcess(object):
     def name(self):
         return self._name
     @property
-    def backup_object(self):
-        return self._backup_object
+    def handler(self):
+        return self._handler
     @property
     def stdin(self):
         return self._stdin
@@ -353,9 +353,9 @@ class ZFSProcessThread(ZFSProcess):
     The processing code can be passed in as target, or a subclass can implement
     its own _process method.
     """
-    def __init__(self, name, zfsbackup, target=None,
+    def __init__(self, name, handler, target=None,
                  stdin=None, stdout=None, stderr=None):
-        super(ZFSProcessThread, self).__init__(name, zfsbackup,
+        super(ZFSProcessThread, self).__init__(name, handler,
                                                stdin=stdin,
                                                stdout=stdout,
                                                stderr=stderr)
@@ -456,7 +456,7 @@ class ZFSProcessThread(ZFSProcess):
         except BaseException as e:
             # Deliberately catching all exceptions
             self._exception = None if self._stop else e
-        self.backup_object.HelperFinished(self, exc=self._exception)
+        self.handler.HelperFinished(self, exc=self._exception)
         # Now close the files in _to_close:
         for f in self._to_close:
             try:
@@ -489,9 +489,9 @@ class ZFSProcessCommand(ZFSProcess):
     is not started until the start method is invoked.  For the initializer,
     if any of stdin, stdout, stderr is None, it will be replaced by subprocess.PIPE.
     """
-    def __init__(self, name, zfsbackup, command,
+    def __init__(self, name, handler, command,
                  stdin=None, stdout=None, stderr=None):
-        super(ZFSProcessCommand, self).__init__(name, zfsbackup, stdin, stdout, stderr)
+        super(ZFSProcessCommand, self).__init__(name, handler, stdin, stdout, stderr)
         # Copy it
         self._command = command[:]
         
@@ -521,7 +521,7 @@ class ZFSProcessCommand(ZFSProcess):
         except (OSError, ValueError, subprocess.CalledProcessError) as e:
             self._started.set()
             self._exception = None if self._stop else e
-            self.backup_object.HelperFinished(self, exc=self._exception)
+            self.handler.HelperFinished(self, exc=self._exception)
         finally:
             self._exited.set()
             
