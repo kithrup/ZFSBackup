@@ -11,6 +11,7 @@ import errno
 import boto3
 import botocore
 import socket
+import fcntl
 from enum import Enum
 
 if sys.version_info[0] == 2:
@@ -255,13 +256,13 @@ class ZFSBackupChunkPendingError(ZFSBackupChunkError):
         super(ZFSBackupChunkPendingError, self).__init__(snapname, chunkname,
                                                           "Chunk file {} for snapshot {} has not completed transferring".format(chunkname, snapname))
         
-class ZFSProcess(object):
+class ZFSHelper(object):
     """
     This is the base class for running subprocesses as part of the
     backup or restore process.  It works with the ZFSBackup
     object, for coordiantion, error reporting, and termination.
 
-    A ZFSProcess may be implemented using a subprocess (using Popen,
+    A ZFSHelper may be implemented using a subprocess (using Popen,
     since it is expected to be part of the pipeline), or via threads.
     
     It must implement start, stop, and wait methods.  (wait must be
@@ -278,12 +279,15 @@ class ZFSProcess(object):
     if that occurred, via zfsbackup.HelperFinished(self, exc).  (Setting
     exc to None if there was no error.)
     """
-    def __init__(self, name, handler, stdin=None, stdout=None, stderr=None):
+    def __init__(self, *args, **kwargs):
+        name = kwargs.pop("name", None)
+        handler = kwargs.pop("handler", None)
+        stdin = kwargs.pop("stdin", None)
+        stdout = kwargs.pop("stdout", None)
+        stderr = kwargs.pop("stderr", None)
         # Quick sanity checks
         if handler is None:
             raise ValueError("handler must be set")
-        if stdin is None and stdout is None:
-            raise ValueError("At least one of stdin and stdout must be defined")
         self._handler = handler
         self._name = name
         self._stdin = stdin
@@ -295,6 +299,7 @@ class ZFSProcess(object):
         self._exited = threading.Event()
         self._exception = None
         self._stop = False
+        super(ZFSHelper, self).__init__(*args, **kwargs)
         return
     
     @property
@@ -330,6 +335,8 @@ class ZFSProcess(object):
         Common code to start the thread; subclasses need to implement _run, and
         do any setup in their implementation of start().
         """
+        if self.stdin is None and self.stdout is None:
+            raise ValueError("{}.start: At least one of stdin and stdout must be defined".format(self.name))
         self._thread = threading.Thread(target=self._run)
         self._thread.run()
         self._started.wait()
@@ -340,7 +347,7 @@ class ZFSProcess(object):
     def wait(self):
         raise NotImplementedError("Base class does not implement wait method")
     
-class ZFSProcessThread(ZFSProcess):
+class ZFSHelperThread(ZFSHelper):
     """
     Implement a ZSFSProcess as a thread -- instead of fork/execing, we'll
     just create a thread, which will do the work.  All of the constraints and
@@ -353,12 +360,9 @@ class ZFSProcessThread(ZFSProcess):
     The processing code can be passed in as target, or a subclass can implement
     its own _process method.
     """
-    def __init__(self, name, handler, target=None,
-                 stdin=None, stdout=None, stderr=None):
-        super(ZFSProcessThread, self).__init__(name, handler,
-                                               stdin=stdin,
-                                               stdout=stdout,
-                                               stderr=stderr)
+    def __init__(self, *args, **kwargs):
+        target = kwargs.pop("target", None)
+        super(ZFSHelperThread, self).__init__(*args, **kwargs)
         if target and not callable(target):
             raise ValueError("Thread target must be callable")
         self._target = target
@@ -482,23 +486,24 @@ class ZFSProcessThread(ZFSProcess):
         if self._exception:
             raise self._exception
         
-class ZFSProcessCommand(ZFSProcess):
+class ZFSHelperCommand(ZFSHelper):
     """
-    Implement a ZFSProcess as a command -- that is, it will use a subprocess,
+    Implement a ZFSHelper as a command -- that is, it will use a subprocess,
     specifically Popen.  The process is run in a separate thread.  The command
     is not started until the start method is invoked.  For the initializer,
     if any of stdin, stdout, stderr is None, it will be replaced by subprocess.PIPE.
     """
-    def __init__(self, name, handler, command,
-                 stdin=None, stdout=None, stderr=None):
-        super(ZFSProcessCommand, self).__init__(name, handler, stdin, stdout, stderr)
+    def __init__(self, *args, **kwargs):
+        command = kwargs.pop("command", [])
+        super(ZFSHelperCommand, self).__init__(*args, **kwargs)
         # Copy it
         self._command = command[:]
-        
+        print("{}.init(command={})".format(self.name, self.command), file=sys.stderr)
+
     @property
     def command(self):
         return self._command
-    
+
     def _run(self):
         """
         Invoked as part of the thread handler.
@@ -530,8 +535,9 @@ class ZFSProcessCommand(ZFSProcess):
         Starts the command im a separate thread.
         We do setup here, and let the base class go from there.
         """
+        print("{}.start, self.stdin={}, self.stdout={}".format(self.name, self.stdin, self.stdout), file=sys.stderr)
         self._proc = None
-        super(ZFSProcessCommand, self).start()
+        super(ZFSHelperCommand, self).start()
         return
 
     def stop(self):
@@ -545,7 +551,7 @@ class ZFSProcessCommand(ZFSProcess):
             if self._exception:
                 raise self._exception
             
-class ZFSBackupFilter(object):
+class ZFSBackupFilterBase(object):
     """
     Base class for ZFS backup filters.
     Filters have several properties, and start_backup() and start_restore()
@@ -558,373 +564,167 @@ class ZFSBackupFilter(object):
     filter, for example.  This is important for some ZFSBackups subclasses,
     such as ZFSBackupSSH, which need to apply transformative filters on
     the other end as part of the backup and restore.  By default, it's
-    true; subclasses can change it, and the object can alter it.
+    false; subclasses can change it, and the object can alter it.
+
+    This base class exists only so it can be incorporated into subclasses.
     """
-    def __init__(self, name="Null Filter"):
-        self.transformative = True
+    def __init__(self, *args, **kwargs):
+        name = kwargs.pop("name", "Null Filter")
+        self.transformative = kwargs.pop("transformative", False)
+        self.mode = None
         self._name = name
+        super(ZFSBackupFilterBase, self).__init__(*args, **kwargs)
         
-    @property
-    def error_output(self):
-        return None
-    @error_output.setter
-    def error_output(self, e):
-        return
-    
     @property
     def name(self):
         return self._name
-
+    @name.setter
+    def name(self, n):
+        self._name = n
+        return
     @property
     def transformative(self):
         return self._transformative
     @transformative.setter
-    def transformative(self, b):
-        self._transformative = b
+    def transformative(self, t):
+        self._transformative = t
+        return
 
+    @property
+    def mode(self):
+        return self._mode
+    @mode.setter
+    def mode(self, mode):
+        if not mode in ("backup", "restore", None):
+            raise ValueError("Invalid mode {}".format(mode))
+        self._mode = mode
+        return
     @property
     def backup_command(self):
         return []
     @property
     def restore_command(self):
         return []
-    
+
+    # Actually this needs to go in the derived class
+    @property
+    def command(self):
+        if self.mode == "backup":
+            return self.backup_command
+        elif self.mode == "restore":
+            return self.restore_command
+        elif self.mode == None:
+            return None
+        else:
+            raise ValueError("Filter mode is not set")
+
+    """
+    Backups are done by creating a pipline that goes:
+    zfs send | filter | filter | ZFSBackup<class>
+    Restores are done the opposite way:
+    ZFSBackup<class> | filter | filter | zfs recv
+    So the start_backup and start_restore methods set
+    self.stdin and self.stdout, respectively.
+    """
     def start_backup(self, source):
-        """
-        Start the filter when doing a backup.
-        E.g., for a compression filter, this would
-        start the command (in a subprocess) to
-        run gzip.
-        """
-        return source
+        print("{}.start_backup(source={})".format(self.name, source), file=sys.stderr)
+        self.mode = "backup"
+        self.stdin = source
+        self.start()
+        return self.stdout
 
     def start_restore(self, source):
-        """
-        Start the filter when doing a restore.
-        E.g., for a compression filter, this would
-        start the command (in a subprocess) to
-        run 'gzcat'.
-        """
-        return source
+        self.mode = "restore"
+        self.stdout = source
+        self.start()
+        return self.stdin
 
     def finish(self):
         """
         Any cleanup work required for the filter.
-        In the base class, that's nothing.
+        This is to be called _after_ the filter has
+        completed.
         """
-        pass
+        self.mode = None
     
-class ZFSBackupFilterThread(ZFSBackupFilter):
+class ZFSBackupFilterCommand(ZFSBackupFilterBase, ZFSHelperCommand):
     """
-    Base class for a thread-based filter.  Either it should be
-    subclassed (see ZFSBackupFilterCounter below), or it should
-    be called with a callable object as the "process=" parameter.
-    The process method may need to check ZFSBackupFilterThread.mode
-    to decide if it is backing up or restoring.
-    
-    Interestingly, this doesn't seem to actually work the way I'd expected:
-    when writing from a thread to a popen'd pipe, the pipe will block, even
-    when a thread closes the write end of the pipe.
+    Implement a filter as a command -- that is, it creates a thread,
+    and runs a subprocess in that thread.  Note the multiple inheritance.
     """
-    def __init__(self, process=None, name="Thread Filter"):
-        super(ZFSBackupFilterThread, self).__init__(name=name)
-        self.thread = None
-        self.source = None
-        self.input_pipe = None
-        self.output_pipe = None
-        self.transformative = False
-        self._mode = None
-        
+    def __init__(self, *args, **kwargs):
+        self.backup_command = kwargs.pop("backup_command", ["/bin/cat"])
+        self.restore_command = kwargs.pop("restore_command", None)
+        super(ZFSBackupFilterCommand, self).__init__(*args, **kwargs)
+
     @property
-    def mode(self):
-        return self._mode
-    
+    def backup_command(self):
+        return self._backup_command
+    @backup_command.setter
+    def backup_command(self, cmd):
+        self._backup_command = cmd[:]
+        return
+    @property
+    def restore_command(self):
+        return self._restore_command if self._restore_command else self.backup_command
+    @restore_command.setter
+    def restore_command(self, cmd):
+        self._restore_command = cmd[:] if cmd else None
+        return
+
+    @property
+    def command(self):
+        if self.mode == "backup":
+            return self.backup_command
+        elif self.mode == "restore":
+            return self.restore_command
+        elif self.mode == None:
+            return None
+        else:
+            raise ValueError("Unknown mode")
+        
+class ZFSBackupFilterThread(ZFSBackupFilterBase, ZFSHelperThread):
+    """
+    Implement a filter as a thread -- that is, it creates a thread,
+    rather than running a subprocess.  Note the multiple inheritance.
+    """
+    def __init__(self, *args, **kwargs):
+        super(ZFSBackupFilterThread, self).__init__(*args, **kwargs)
+
     @property
     def backup_command(self):
         return None
-
     @property
     def restore_command(self):
         return None
-    
-    def process(self, buf):
-        # Subclasses should do any processing here
-        if self._process:
-            return self._process(buf)
-        else:
-            return buf
-        
-    def run_backup(self, *args, **kwargs):
-        # We use a try/finally block to ensure
-        # the write-side is always closed.
-        try:
-            while True:
-                b = self.stream.read(1024*1024)
-                if b:
-                    if debug:
-                        print("In backup thread {}, read {} bytes".format(self.name, len(b)), file=sys.stderr)
-                    temp_buf = self.process(b)
-                    try:
-                        os.write(self.output_pipe, b)
-                    except (OSError, IOError) as e:
-                        if verbose:
-                            print("In backup thread {0}, trying to write {1} bytes to {2}, got exception {3}".format(
-                                self.name, len(b), self.output_pipe, str(e)),
-                                  file=sys.stderr)
-                        raise
-                    if debug:
-                        print("In backup thread {}, just wrote {} bytes".format(self.name, len(b)), file=sys.stderr)
-                else:
-                    if debug:
-                        print("In backup thread {}, done reading from stream".format(self.name), file=sys.stderr)
-                    break
-        except BaseException as e:
-            print("In backup thread {}, got exception {}".format(self.name, str(e)), file=sys.stderr)
-            raise
-        finally:
-            try:
-                if debug:
-                    print("Thread {}, closing based on mode {}".format(self.name, self.mode), file=sys.stderr)
-                os.close(self.output_pipe)
-            except OSError:
-                pass
-
-    def run_restore(self, *args, **kwargs):
-        # We use a try/finally block to ensure
-        # the stream is always closed
-        try:
-            while True:
-                b = os.read(self.input_pipe, 1024*1024)
-                if b:
-                    if debug:
-                        print("In restore thread {}, read {} bytes".format(self.name, len(b)), file=sys.stderr)
-                    temp_buf = self.process(b)
-                    try:
-                        self.stream.write(temp_buf)
-                    except (OSError, IOError) as e:
-                        if verbose:
-                            print("In restore thread {0}, trying to write {1} bytes to {2}, got exception {3}".format(
-                                self.name, len(temp_buf), self.stream, str(e)),
-                                  file=sys.stderr)
-                        raise
-                    if debug:
-                        print("In restore thread {}, just wrote {} bytes".format(self.name, len(temp_buf)), file=sys.stderr)
-                else:
-                    if debug:
-                        print("In restore thread {}, done reading from input pipe".format(self.name), file=sys.stderr)
-                    break
-        except BaseException as e:
-            print("In restore thread {}, got exception {}".format(self.name, str(e)), file=sys.stderr)
-            raise
-        finally:
-            if debug:
-                print("In restore thread {}, closing stream".format(self.name), file=sys.stderr)
-            try:
-                self.stream.close()
-            except BaseException as e:
-                if debug:
-                    print("Got exception {} while trying to close stream".format(str(e)), file=sys.stderr)
-            if debug:
-                print("In restore thread {}, done closing files".format(self.name), file=sys.stderr)
-
-    def _start(self, stream):
-        import fcntl
-        
-        self.stream = stream
-        (self.input_pipe, self.output_pipe) = os.pipe()
-        if debug:
-            print("Thread {}:  input_pipe = {}, output_pipe = {}".format(self.name,
-                                                                         self.input_pipe,
-                                                                         self.output_pipe),
-                  file=sys.stderr)
-        # We need to set F_CLOEXEC on pipes, lest a
-        # subsequent Popen call keep a dangling open
-        # reference around.
-        flags = fcntl.fcntl(self.output_pipe, fcntl.F_GETFD)
-        fcntl.fcntl(self.output_pipe, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
-        fcntl.fcntl(self.input_pipe, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
-
-        self._py_read = None
-        self._py_write = None
-        if self.mode == "backup":
-            self._py_read = os.fdopen(self.input_pipe, "rb")
-            rv = self._py_read
-        elif self.mode == "restore":
-            self._py_write = os.fdopen(self.output_pipe, "wb")
-            rv = self._py_write
-
-        if self.mode == "backup":
-            self.thread = threading.Thread(target=self.run_backup)
-        elif self.mode == "restore":
-            self.thread = threading.Thread(target=self.run_restore)
-            
-        self.thread.daemon = True
-        self.thread.start()
-        if debug:
-            print("In thread start_{}, returning {}".format(self._mode, rv),
-                  file=sys.stderr)
-        return rv
-    
-    def start_backup(self, stream):
-        if self.thread:
-            self.thread = None
-        self._mode = "backup"
-        return self._start(stream)
-
-    def start_restore(self, stream):
-        if self.thread:
-            self.thread = None
-        self._mode = "restore"
-        return self._start(stream)
+    @property
+    def command(self):
+        return None
 
     def finish(self):
-        if debug:
-            print("In {} thread filter {}, going to call join".format(self.mode, self.name), file=sys.stderr)
-        if self.thread:
-            self.thread.join()
-            if debug:
-                print("Done with join!", file=sys.stderr)
+        self.wait()
+        if self._thread:
+            self._thread.join()
+            self._thread = None
         return
     
 class ZFSBackupFilterCounter(ZFSBackupFilterThread):
     """
-    A sample thread filter.  All this does is count the
-    bytes that come in to be processed.
+    A simple thread filter; all this does is count the bytes
+    that come in to be processed.
     """
-    def __init__(self, handler=None, name="ZFS Count Filter"):
-        super(ZFSBackupFilterCounter, self).__init__(name=name)
+    def __init__(self, *args, **kwargs):
+        super(ZFSBackupFilterThread, self).__init__(*args, **kwargs)
         self._count = 0
-        self.handler = handler
-
-    def process(self, b):
-        self._count += len(b)
-        return b
-
-    def start_backup(self, source):
-        return super(ZFSBackupFilterCounter, self).start_backup(source)
-
-    def start_restore(self, source):
-        return super(ZFSBackupFilterCounter, self).start_restore(source)
-    
-    @property
-    def handler(self):
-        return self._handler
-    @handler.setter
-    def handler(self, h):
-        self._handler = h
 
     @property
     def count(self):
-        # This will block until the thread is done
-        self.finish()
-        if self.handler and iscallable(self.handler):
-            self.handler(self._count)
+        self.wait()
         return self._count
-
-class ZFSBackupFilterCommand(ZFSBackupFilter):
-    """
-    Derived class for backup filters based on commands.
-    This adds a coupe properties, and starts the appropriate commands
-    in a Popen instance.  The error parameter in the constructor is
-    used to indicate where stderr should go; by default, it goes to
-    /dev/null
-    If restore_command is None, then backup_command will be used.
-    """
-    def __init__(self, backup_command=["/bin/cat"], restore_command=None,
-                 name='Command-based backup filter', error=None):
-        super(ZFSBackupFilterCommand, self).__init__(name=name)
-        self._backup_command=backup_command
-        self._restore_command=restore_command
-        self.error = error
-        self.proc = None
-        
-    @property
-    def backup_command(self):
-        return self._backup_command
-    @property
-    def restore_command(self):
-        return self._restore_command or self.backup_command
-    @property
-    def error_output(self):
-        return self._error_output
-    @error_output.setter
-    def error_output(self, where):
-        if self.error:
-            self.error.close()
-        self._error_output = where
-
-    def proc_wait_thread(self, *args, **kwargs):
-        self.proc.wait()
-        if debug:
-            print("{} finished waiting for command, rv = {}".format(self.name,
-                                                                    self.proc.returncode),
-                  file=sys.stderr)
-        for f in args:
-            try:
-                f.close()
-            except:
-                print("{} got exception on closing {}".format(self.name, f), file=sys.stderr)
-
-    def start_restore(self, source):
-        """
-        source is a file-like object, usually a pipe.
-        We run Popen, setting source as stdout, and
-        subprocess.PIPE as stdin, and return popen.stdin.
-        If error is None, we open /dev/null for writig and
-        use that.
-        """
-        if self.error is None:
-            self.error = open("/dev/null", "w+b")
-        self.proc = POPEN(self.restore_command,
-                          bufsize=1024 * 1024,
-                          stdout=source,
-                          stdin=subprocess.PIPE,
-                          stderr=self.error)
-        thrd = threading.Thread(target=self.proc_wait_thread, args=[source, self.proc.stdin])
-        thrd.daemon = True
-        thrd.start()
-        return self.proc.stdin
     
-    def start_backup(self, source):
-        """
-        source is a file-like object, usually a pipe.
-        We run Popen, and setting source up as stdin,
-        and subprocess.PIPE as output, and return
-        popen.stdout.
-        If error is None, we open /dev/null for writing
-        and use that.
-        """
-        if self.error is None:
-            self.error = open("/dev/null", "w+b")
-        if debug:
-            print("start_backup: command = {}, stdin={}, stderr={}".format(" ".join(self.backup_command),
-                                                                           source,
-                                                                           self.error),
-                  file=sys.stderr)
-        self.proc = POPEN(self.backup_command,
-                          bufsize=1024 * 1024,
-                          stderr=self.error,
-                          stdin=source,
-                          stdout=subprocess.PIPE)
-        if debug:
-            print("In start_bauckup for command, source = {}, proc.stdout = {}".format(source,
-                                                                                       self.proc.stdout),
-                  file=sys.stderr)
-        return self.proc.stdout
-
-    def finish(self):
-        if debug:
-            print("In command filter {}, calling proc.wait".format(self.name), file=sys.stderr)
-        if self.proc:
-            if self.proc.stdin:
-                self.proc.stdin.close()
-            self.proc.wait()
-        if self.error:
-            try:
-                self.error.close()
-            except OSError:
-                pass
-            self.error = None
+    def _process(self, buffer):
+        self._count += len(buffer)
+        return buffer
     
 class ZFSBackupFilterEncrypted(ZFSBackupFilterCommand):
     """
@@ -933,8 +733,10 @@ class ZFSBackupFilterEncrypted(ZFSBackupFilterCommand):
     of it here.
     We require a password file (for now, anyway).
     """
-    def __init__(self, cipher="aes-256-cbc",
-                 password_file=None):
+    def __init__(self, *args, **kwargs):
+        cipher = kwargs.pop("cipher", "aes-256-cbc")
+        password_file = kwargs.pop("password_file", None)
+
         def ValidateCipher(cipher):
             if cipher is None:
                 return False
@@ -952,42 +754,39 @@ class ZFSBackupFilterEncrypted(ZFSBackupFilterCommand):
         self.cipher = cipher
         self.password_file = password_file
         
-        backup_command = ["/usr/bin/openssl",
-                          "enc", "-{}".format(cipher),
-                          "-e",
-                          "-salt",
-                          "-pass", "file:{}".format(password_file)]
-        restore_command = ["/usr/bin/openssl",
-                           "enc", "-{}".format(cipher),
-                           "-d",
-                           "-salt",
-                           "-pass", "file:{}".format(password_file)]
-
-        super(ZFSBackupFilterEncrypted, self).__init__(backup_command=backup_command,
-                                                       restore_command=restore_command,
-                                                       name='{} encryption filter'.format(self.cipher))
+        kwargs["backup_command"] = ["/usr/bin/openssl",
+                                    "enc", "-{}".format(cipher),
+                                    "-e",
+                                    "-salt",
+                                    "-pass", "file:{}".format(password_file)]
+        kwargs["restore_command"] = ["/usr/bin/openssl",
+                                     "enc", "-{}".format(cipher),
+                                     "-d",
+                                     "-salt",
+                                     "-pass", "file:{}".format(password_file)]
+        kwargs["name"] = '{} encryption filter'.format(self.cipher)
+        super(ZFSBackupFilterEncrypted, self).__init__(*args, **kwargs)
         
 class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
     """
     A sample command filter, for compressing.
     One optional parameter:  pigz.
     """
-    def __init__(self, pigz=False):
-        if pigz:
-            self.pigz = True
-            backup_command = "/usr/local/bin/pigz"
-            restore_command = "/usr/local/bin/unpigz"
-            name='pigz compressor filter'
+    def __init__(self, *args, **kwargs):
+        use_pigz = kwargs.pop("pigz", False)
+        if use_pigz:
+            kwargs["backup_command"] = ["/usr/local/bin/pigz"]
+            kwargs["restore_command"]= ["/usr/local/bin/unpigz"]
+            kwargs["name"] = 'pigz compressor filter'
         else:
-            self.pigz = False
-            backup_command = "/usr/bin/gzip"
-            restore_command = "/usr/bin/gunzip"
-            name='gzip compressor filter'
+            kwargs["backup_command"] = ["/usr/bin/gzip"]
+            kwargs["restore_command"] = ["/usr/bin/gunzip"]
+            kwargs["name"] = 'gzip compressor filter'
             
-        super(ZFSBackupFilterCompressed, self).__init__(backup_command=[backup_command],
-                                                        restore_command=[restore_command],
-                                                        name=name)
-        
+        self.pigz = use_pigz
+        print("ZFSBackupFilterCompressed({}, {})".format(args, kwargs), file=sys.stderr)
+        super(ZFSBackupFilterCompressed, self).__init__(*args, **kwargs)
+
     @property
     def name(self):
         return "pigz compress filter" if self.pigz else "gzip compress filter"
@@ -1274,8 +1073,12 @@ class ZFSBackup(object):
             # ZFS->ZFS replication doesn't use filters.
             fobj = stream
             try:
-                CHECK_CALL(command, stdin=fobj,
-                           stderr=error_output)
+                sender = ZFSHelperCommand(command=command,
+                                          stdin=fobj,
+                                          stdout=error_output,
+                                          stderr=error_output)
+                sender.start()
+                sender.wait()
             except subprocess.CalledProcessError:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read())
@@ -2983,13 +2786,13 @@ def main():
     uncompressed_size = None; compressed_size = None
     if args.compressed:
         if verbose:
-            uncompressed_size = ZFSBackupFilterCounter(name="uncompressed")
-            compressed_size = ZFSBackupFilterCounter(name="compressed")
+            uncompressed_size = ZFSBackupFilterCounter(name="uncompressed", handler=backup)
+            compressed_size = ZFSBackupFilterCounter(name="compressed", handler=backup)
             if operation.command == "restore":
                 backup.AddFilter(compressed_size)
             else:
                 backup.AddFilter(uncompressed_size)
-        backup.AddFilter(ZFSBackupFilterCompressed(pigz=args.use_pigz))
+        backup.AddFilter(ZFSBackupFilterCompressed(handler=backup, pigz=args.use_pigz))
         if verbose:
             if operation.command == "restore":
                 backup.AddFilter(uncompressed_size)
@@ -2997,7 +2800,8 @@ def main():
                 backup.AddFilter(compressed_size)
             
     if args.encrypted:
-        encrypted_filter = ZFSBackupFilterEncrypted(cipher=args.cipher,
+        encrypted_filter = ZFSBackupFilterEncrypted(handler=backup,
+                                                    cipher=args.cipher,
                                                     password_file=args.password_file)
         backup.AddFilter(encrypted_filter)
         
