@@ -2825,7 +2825,7 @@ def main():
             else:
                 backup.AddFilter(uncompressed_size)
         backup.AddFilter(ZFSBackupFilterCompressed(handler=backup, pigz=args.use_pigz))
-        if verbose and False:
+        if verbose:
             if operation.command == "restore":
                 backup.AddFilter(uncompressed_size)
             else:
