@@ -22,6 +22,10 @@ elif sys.version_info[0] == 3:
 debug = True
 verbose = False
 
+def SetNonBlock(f):
+    fl = fcntl.fcntl(f.fileno(), fcntl.F_GETFL)
+    fcntl.fcntl(f.fileno(), fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    
 def _find_snapshot_index(name, snapshots):
     """
     Given a list of snapshots (that is, an ordered-by-creation-time
@@ -337,9 +341,13 @@ class ZFSHelper(object):
         """
         if self.stdin is None and self.stdout is None:
             raise ValueError("{}.start: At least one of stdin and stdout must be defined".format(self.name))
+        self._started.clear()
+        self._exited.clear()
         self._thread = threading.Thread(target=self._run)
-        self._thread.run()
+        self._thread.daemon = True
+        self._thread.start()
         self._started.wait()
+        self._started.clear()
         return
     
     def stop(self):
@@ -393,7 +401,7 @@ class ZFSHelperThread(ZFSHelper):
             read_side, write_side = os.pipe()
             for f in [read_side, write_side]:
                 fl = fcntl.fcntl(f, fcntl.F_GETFL)
-                fcntl.fcntl(f, fcntl.F_SETFL, fl | os.O_NONBLOCK | fcntl.FD_CLOEXEC)
+                fcntl.fcntl(f, fcntl.F_SETFL, fl | fcntl.FD_CLOEXEC)
             self.stdin = os.fdopen(write_side, "wb")
             read_from = os.fdopen(read_side, "rb")
             self._to_close.append(read_from)
@@ -406,7 +414,7 @@ class ZFSHelperThread(ZFSHelper):
             read_side, write_side = os.pipe()
             for f in [read_side, write_side]:
                 fl = fcntl.fcntl(f, fcntl.F_GETFL)
-                fcntl.fcntl(f, fcntl.F_SETFL, fl | os.O_NONBLOCK | fcntl.FD_CLOEXEC)
+                fcntl.fcntl(f, fcntl.F_SETFL, fl | fcntl.FD_CLOEXEC)
             self.stdout = os.fdopen(read_side, "rb")
             write_to = os.fdopen(write_side, "wb")
             self._to_close.append(write_to)
@@ -419,6 +427,9 @@ class ZFSHelperThread(ZFSHelper):
         # Inform the main thread we've started.
         self._started.set()
         mByte = 1024 * 1024
+        # We want to set read_from and write_to to be non-blocking
+        for f in [read_from, write_to]:
+            SetNonBlock(f)
         try:
             def doWrite(buffer):
                 """
@@ -435,7 +446,10 @@ class ZFSHelperThread(ZFSHelper):
                         # We use os.write() because it will tell us how many
                         # bytes were written, which is important if there's
                         # a full pipe.
-                        nwritten += os.write(write_to.fileno(), buffer[nwritten:])
+                        try:
+                            nwritten += os.write(write_to.fileno(), buffer[nwritten:])
+                        except OSError:
+                            print("Got OSError", file=sys.stderr)
                     if self._stop:
                         return
                 return
@@ -447,13 +461,13 @@ class ZFSHelperThread(ZFSHelper):
                 if r:
                     # Great, we have input ready. Or eof.
                     b = read_from.read(mByte)
-                    if not b:
-                        # EOF
-                        break
-                    else:
+                    if b:
                         temp_buf = (self._target if callable(self._target) else self._process)(b)
                         # Great, we have data we want to write out
                         doWrite(temp_buf)
+                    else:
+                        # EOF, so let's close the output
+                        break
                 if self._stop:
                     break
             self._exception = None
@@ -498,7 +512,6 @@ class ZFSHelperCommand(ZFSHelper):
         super(ZFSHelperCommand, self).__init__(*args, **kwargs)
         # Copy it
         self._command = command[:]
-        print("{}.init(command={})".format(self.name, self.command), file=sys.stderr)
 
     @property
     def command(self):
@@ -513,12 +526,14 @@ class ZFSHelperCommand(ZFSHelper):
             # I'd have to set up the pipes for that; but that
             # could also be done in shared code at that point.
             self._proc = POPEN(self.command,
-                               stdin=subprocess.PIPE if self.stdin is None else self.stdin,
-                               stdout=subprocess.PIPE if self.stdout is None else self.stdout,
-                               stderr=subprocess.PIPE if self.stderr is None else self.stderr)
-            self.stdin = self._proc.stdin
-            self.stdout = self._proc.stdout
-            self.stderr = self._proc.stderr
+                               bufsize=1024*1024,
+                               close_fds=True,
+                               stdin=self.stdin or subprocess.PIPE,
+                               stdout=self.stdout or subprocess.PIPE,
+                               stderr=self.stderr or subprocess.PIPE)
+            self.stdin = self.stdin or self._proc.stdin
+            self.stdout = self.stdout or self._proc.stdout
+            self.stderr = self.stderr or self._proc.stderr
             self._started.set()
             self._proc.wait()
             if self._proc.returncode != 0:
@@ -535,7 +550,6 @@ class ZFSHelperCommand(ZFSHelper):
         Starts the command im a separate thread.
         We do setup here, and let the base class go from there.
         """
-        print("{}.start, self.stdin={}, self.stdout={}".format(self.name, self.stdin, self.stdout), file=sys.stderr)
         self._proc = None
         super(ZFSHelperCommand, self).start()
         return
@@ -546,6 +560,9 @@ class ZFSHelperCommand(ZFSHelper):
             self._proc.terminate()
             
     def wait(self):
+        if self._thread:
+            self._thread.join()
+            self._thread = None
         if self._proc:
             self._proc.wait()
             if self._exception:
@@ -571,9 +588,9 @@ class ZFSBackupFilterBase(object):
     def __init__(self, *args, **kwargs):
         name = kwargs.pop("name", "Null Filter")
         self.transformative = kwargs.pop("transformative", False)
+        super(ZFSBackupFilterBase, self).__init__(*args, **kwargs)
         self.mode = None
         self._name = name
-        super(ZFSBackupFilterBase, self).__init__(*args, **kwargs)
         
     @property
     def name(self):
@@ -627,9 +644,9 @@ class ZFSBackupFilterBase(object):
     self.stdin and self.stdout, respectively.
     """
     def start_backup(self, source):
-        print("{}.start_backup(source={})".format(self.name, source), file=sys.stderr)
         self.mode = "backup"
         self.stdin = source
+        self.stdout = None
         self.start()
         return self.stdout
 
@@ -646,7 +663,10 @@ class ZFSBackupFilterBase(object):
         completed.
         """
         self.mode = None
-    
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+        
 class ZFSBackupFilterCommand(ZFSBackupFilterBase, ZFSHelperCommand):
     """
     Implement a filter as a command -- that is, it creates a thread,
@@ -689,6 +709,7 @@ class ZFSBackupFilterThread(ZFSBackupFilterBase, ZFSHelperThread):
     rather than running a subprocess.  Note the multiple inheritance.
     """
     def __init__(self, *args, **kwargs):
+        print("ZFSBackupFilterThread({}, {})".format(args, kwargs), file=sys.stderr)
         super(ZFSBackupFilterThread, self).__init__(*args, **kwargs)
 
     @property
@@ -714,7 +735,7 @@ class ZFSBackupFilterCounter(ZFSBackupFilterThread):
     that come in to be processed.
     """
     def __init__(self, *args, **kwargs):
-        super(ZFSBackupFilterThread, self).__init__(*args, **kwargs)
+        super(ZFSBackupFilterCounter, self).__init__(*args, **kwargs)
         self._count = 0
 
     @property
@@ -784,9 +805,8 @@ class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
             kwargs["name"] = 'gzip compressor filter'
             
         self.pigz = use_pigz
-        print("ZFSBackupFilterCompressed({}, {})".format(args, kwargs), file=sys.stderr)
         super(ZFSBackupFilterCompressed, self).__init__(*args, **kwargs)
-
+        
     @property
     def name(self):
         return "pigz compress filter" if self.pigz else "gzip compress filter"
@@ -924,12 +944,16 @@ class ZFSBackup(object):
             
     def _filter_backup(self, source, error=sys.stderr):
         # Private method, to stitch the backup filters together.
+        if source is None:
+            raise ValueError("{}._filter_backup: source is None".format(self))
         input = source
         for f in self.filters:
-            f.error_output = error
+            f.stderr = error
             if debug:
                 print("Starting filter {} ({}), input = {}".format(f.name, f.backup_command, input), file=sys.stderr)
             input = f.start_backup(input)
+            if input is None:
+                raise ValueError("Filter {} returned None for stream".format(f.name))
         return input
     
     def _filter_restore(self, destination, error=None, use_filters=None):
@@ -1230,11 +1254,12 @@ class ZFSBackup(object):
             with tempfile.TemporaryFile(mode="a+") as error_output:
                 with open("/dev/null", "w+") as devnull:
                     mByte = 1024 * 1024
-                    send_proc = POPEN(command,
-                                      bufsize=mByte,
-                                      stdin=devnull,
-                                      stderr=error_output,
-                                      stdout=subprocess.PIPE)
+                    send_proc = ZFSHelperCommand(command=command,
+                                                 name="ZFS Backup of {}".format(self.source),
+                                                 handler=self,
+                                                 stdin=devnull,
+                                                 stderr=error_output)
+                    send_proc.start()
                     if debug:
                         print("backup_dict = {}".format(backup_dict), file=sys.stderr)
                         print("send_proc.stdout = {}".format(send_proc.stdout), file=sys.stderr)
@@ -2556,14 +2581,21 @@ class ZFSBackupCount(ZFSBackup):
         
     def backup_handler(self, stream, **kwargs):
         fobj = self._filter_backup(stream)
+        if not fobj:
+            raise ValueError("{}, fobj is None".format(self))
         mByte = 1024 * 1024
+        SetNonBlock(fobj)
         while True:
+            r, _, _ = select([fobj], [], [])
+            if not r:
+                
+                continue
             b = fobj.read(mByte)
             if b:
                 self._count += len(b)
             else:
                 break
-
+        
     @property
     def target_snapshots(self):
         return []
@@ -2793,7 +2825,7 @@ def main():
             else:
                 backup.AddFilter(uncompressed_size)
         backup.AddFilter(ZFSBackupFilterCompressed(handler=backup, pigz=args.use_pigz))
-        if verbose:
+        if verbose and False:
             if operation.command == "restore":
                 backup.AddFilter(uncompressed_size)
             else:
