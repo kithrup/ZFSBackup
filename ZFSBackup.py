@@ -1946,6 +1946,9 @@ class ZFSBackupS3(ZFSBackupDirectory):
         self._glacier = glacier
         self._access_key = s3_key
         self._secret_key = s3_secret
+        self._server = server
+        # Should validate rgion!
+        self._region = region
         
         self._s3 = boto3.client('s3', aws_access_key_id=s3_key,
                                 aws_secret_access_key=s3_secret,
@@ -2060,6 +2063,12 @@ class ZFSBackupS3(ZFSBackupDirectory):
                                                            )
         return
         
+    @property
+    def server(self):
+        return self._server
+    @property
+    def region(self):
+        return self._region
     @property
     def glacier(self):
         return self._glacier
