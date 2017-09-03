@@ -786,6 +786,7 @@ class ZFSBackupFilterEncrypted(ZFSBackupFilterCommand):
                                      "-salt",
                                      "-pass", "file:{}".format(password_file)]
         kwargs["name"] = '{} encryption filter'.format(self.cipher)
+        kwargs["transformative"] = True
         super(ZFSBackupFilterEncrypted, self).__init__(*args, **kwargs)
         
 class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
@@ -803,9 +804,9 @@ class ZFSBackupFilterCompressed(ZFSBackupFilterCommand):
             kwargs["backup_command"] = ["/usr/bin/gzip"]
             kwargs["restore_command"] = ["/usr/bin/gunzip"]
             kwargs["name"] = 'gzip compressor filter'
-            
-        self.pigz = use_pigz
+        kwargs["transformative"] = True
         super(ZFSBackupFilterCompressed, self).__init__(*args, **kwargs)
+        self.pigz = use_pigz
         
     @property
     def name(self):

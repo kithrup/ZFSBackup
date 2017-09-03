@@ -30,9 +30,39 @@ the most recent snapshot.  Unless told not to, it will attempt
 to do an incremental backup, by quering the targt for a list of
 snapshots (how depends on which class is used).
 
+### ZFSHelper Class
+
+The ZFSHelper class is set up to allow subcommands and threads to
+be run on behalf of a ZFSBackup object.  ZFSHelpers are used both
+to run subcommands as part of the backup/restore process, and also
+as the basis for filters (see below).  The only two classes that
+should be used directly are:
+
+* ZFSHelperCommand
+  Runs a command, possibly with pipes for input and output.
+  The named parameter "command" is an array, e.g., `command=["/bin/ls", "-l"]`
+* ZFSHelperThread
+  Runs a thread to handle processing.  Processing is either handled by supplying
+  a `target=callable` parameter to the constructor, or by subclassing and providing
+  a `process` method.
+
+The base class has the following (all optional) named parameters to the constructor:
+
+Parameter Name | Description
+--- | ---
+`name` | The name of the object.
+`handler` | A ZFSBackup object to coordinate with.  This only requires a `HelperFinished` method, which takes the ZFSHelper object, and an optional exception (`exc=None`) parameter.  The `handler` parameter is required.
+`stdin` | The standard input to use.  If None, then a pipe will be constructed.
+`stdout` | The same, but for stdout.
+`stderr` | And the last standardone.
+
 ### Filters
 
 Backups can have filters applied, using the class ZFSBackupFilter.
+ZFSBackupFilters are derived from both the ZFSBackupFilterBase and
+ZFSHelper classes.  A `handler` object must be passed in to the
+constructor.
+
 The classes are
 
 * ZFSBackupFilterThread
@@ -43,7 +73,7 @@ The classes are
 
 An example use:
 
-    backup.AddFilter(ZFSBackupFilterCompressed())
+    `backup.AddFilter(ZFSBackupFilterCompressed(handler=backiup))`
 
 which will interpose gzip between the source and target.  (Some
 classes may ignore the filters, as they don't make sense.)  Using
@@ -51,7 +81,7 @@ ZFSBackupFilterCommand, any command can be used; the constructor
 should be given an array of command and arguments -- one for
 backing up, and one for restoring.  As an example:
 
-    filter = ZFSBackupFilterCommand(backup_command=["/bin/cat"])
+    `filter = ZFSBackupFilterCommand(backup_command=["/bin/cat"], handler=backup)`
 
 ## Command-line Usage
 
