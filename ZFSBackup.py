@@ -1680,9 +1680,14 @@ class ZFSBackupDirectory(ZFSBackup):
         
         # Okay, all of the chunks are available.
         # Let's set up a bunch of command filters
+        # Any filters passed into this method come from the
+        # backup itself, and are going to be transformative,
+        # and will only have the restore command.
         restore_filters = []
         for filter in filters:
-            restore_filters.append(ZFSBackupFilterCommand(backup_command=filter))
+            restore_filters.append(ZFSBackupFilterCommand(backup_command=filter,
+                                                          handler=self,
+                                                          transformative=True))
         with tempfile.TemporaryFile() as error_output:
             fobj = self._filter_restore(stream, error=error_output, use_filters=restore_filters)
             try:
