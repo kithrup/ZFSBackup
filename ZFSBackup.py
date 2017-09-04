@@ -709,7 +709,6 @@ class ZFSBackupFilterThread(ZFSBackupFilterBase, ZFSHelperThread):
     rather than running a subprocess.  Note the multiple inheritance.
     """
     def __init__(self, *args, **kwargs):
-        print("ZFSBackupFilterThread({}, {})".format(args, kwargs), file=sys.stderr)
         super(ZFSBackupFilterThread, self).__init__(*args, **kwargs)
 
     @property
@@ -1255,6 +1254,7 @@ class ZFSBackup(object):
             with tempfile.TemporaryFile(mode="a+") as error_output:
                 with open("/dev/null", "w+") as devnull:
                     mByte = 1024 * 1024
+                    self._helper_done.clear()
                     send_proc = ZFSHelperCommand(command=command,
                                                  name="ZFS Backup of {}".format(self.source),
                                                  handler=self,
@@ -1415,17 +1415,15 @@ class ZFSBackup(object):
                     mByte = 1024 * 1024
                     if callable(snapshot_handler):
                         snapshot_handler(stage="start", **restore_dict)
-                    recv_proc = POPEN(command,
-                                      bufsize=mByte,
-                                      stdin=subprocess.PIPE,
-                                      stderr=error_output,
-                                      stdout=devnull)
-                    
                     try:
+                        recv_proc = ZFSHelperCommand(command=command,
+                                                     name="ZFS Restore of {}".format(self.source),
+                                                     handler=self,
+                                                     stdin=devnull,
+                                                     stderr=error_output)
+                        recv_proc.start()
                         self.restore_handler(recv_proc.stdin, **restore_dict)
                         recv_proc.wait()
-                        if recv_proc.returncode:
-                            raise ZFSBackupError("Restore failed with error code {}".format(recv_proc.returncode))
                         if verbose:
                             print("Finished with restore for {}".format(restore_dict["Name"]), file=sys.stderr)
                     except ZFSBackupError as e:

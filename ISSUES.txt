@@ -15,6 +15,9 @@ Known Issues
 
 * Process handling needs significant work.  It doesn't detect
   most failures due to the pipeline.
+  N.B. Process/thread handling has been refactored in a fairly
+  significant way; however, it's still incomplete, and will
+  require some more refactoring.
 
 FIXED:
 
