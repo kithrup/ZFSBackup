@@ -538,6 +538,7 @@ class ZFSHelperCommand(ZFSHelper):
             self._proc.wait()
             if self._proc.returncode != 0:
                 raise subprocess.CalledProcessError(self._proc.returncode, " ".join(self.command))
+            self.handler.HelperFinished(self)
         except (OSError, ValueError, subprocess.CalledProcessError) as e:
             self._started.set()
             self._exception = None if self._stop else e
@@ -918,6 +919,8 @@ class ZFSBackup(object):
         raise ZFSBackupNotImplementedError("delete not implemented in class {}".format(self.__class__.__name__))
     
     def HelperFinished(self, which, exc=None):
+        if verbose:
+            print("HelperFinished({}, exc={})".format(which, exc), file=sys.stderr)
         # Append the helper object / exception pair to the status list.
         self._helper_lock.acquire()
         self._helper_status.append(( which, exc))
@@ -1102,7 +1105,7 @@ class ZFSBackup(object):
                                           stdout=error_output,
                                           stderr=error_output)
                 sender.start()
-                sender.wait()
+#                sender.wait()
             except subprocess.CalledProcessError:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read())
@@ -1261,7 +1264,7 @@ class ZFSBackup(object):
                                                  stdin=devnull,
                                                  stderr=error_output)
                     send_proc.start()
-                    if debug:
+                    if verbose:
                         print("backup_dict = {}".format(backup_dict), file=sys.stderr)
                         print("send_proc.stdout = {}".format(send_proc.stdout), file=sys.stderr)
                     if callable(snapshot_handler):
@@ -1276,8 +1279,9 @@ class ZFSBackup(object):
                             raise ZFSBackupError(error_output.read().rstrip())
                         else:
                             raise
-                    else:
-                        send_proc.wait()
+                    finally:
+                        self._helper_done.wait()
+                    send_proc.wait()
                     if callable(snapshot_handler):
                         snapshot_handler(stage="complete", **backup_dict)
                 self._finish_filters()
@@ -1778,7 +1782,7 @@ class ZFSBackupDirectory(ZFSBackup):
         source_map["snapshots"] = current_snapshots
         self.mapfile[self.source] = source_map
         self._save_mapfile()
-        
+        self._helper_done.set()
                     
     @property
     def prefix(self):
@@ -2545,7 +2549,10 @@ class ZFSBackupSSH(ZFSBackup):
         with tempfile.TemporaryFile() as error_output:
             try:
                 fobj = self._filter_backup(stream, error=error_output)
-                CHECK_CALL(command, stdin=fobj, stderr=error_output)
+                sender = ZFSHelperCommand(command=command,
+                                          stdin=fobj,
+                                          stdout=error_output,
+                                          stderr=error_output)
             except (subprocess.CalledProcessError, ZFSBackupError):
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read().rstrip())
@@ -2608,6 +2615,7 @@ class ZFSBackupCount(ZFSBackup):
                 self._count += len(b)
             else:
                 break
+        self._helper_done.set()
         
     @property
     def target_snapshots(self):
