@@ -1078,6 +1078,13 @@ class ZFSBackup(object):
         creates a Popen subprocess for 'zfs recv' with the appropriate arguments,
         and sets its stdin to stream.
         Subclasses will probably want to replace this method.
+        This method may spawn off a thread, or it may wait; the caller is
+        required to wait for self._helper_done to be set.  (Note that
+        multiple filters means there can be multiple helpers.)
+        Also note that the only caller is ZFBackup.backup(); however,
+        all subclasses must behave the same way, meaning that if the
+        method doesn't run asychronously, then it still needs to
+        call self._helper_done.set().
         """
         # First we create the intervening dataset paths.  That is, the
         # equivalent of 'mkdir -p ${target}/${source}'.
