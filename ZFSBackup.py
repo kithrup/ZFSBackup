@@ -919,7 +919,7 @@ class ZFSBackup(object):
         raise ZFSBackupNotImplementedError("delete not implemented in class {}".format(self.__class__.__name__))
     
     def HelperFinished(self, which, exc=None):
-        if verbose:
+        if debug:
             print("HelperFinished({}, exc={})".format(which, exc), file=sys.stderr)
         # Append the helper object / exception pair to the status list.
         self._helper_lock.acquire()
@@ -1271,7 +1271,7 @@ class ZFSBackup(object):
                                                  stdin=devnull,
                                                  stderr=error_output)
                     send_proc.start()
-                    if verbose:
+                    if debug:
                         print("backup_dict = {}".format(backup_dict), file=sys.stderr)
                         print("send_proc.stdout = {}".format(send_proc.stdout), file=sys.stderr)
                     if callable(snapshot_handler):
