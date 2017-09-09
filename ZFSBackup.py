@@ -1067,8 +1067,11 @@ class ZFSBackup(object):
             # ZFS->ZFS replication doesn't use filters
             fobj = stream
             with open("/dev/null", "w+") as devnull:
-                POPEN(command, stdout=fobj, stderr=error_output,
-                      stdin=devnull)
+                reeiver = ZFSHelperCommand(command=command,
+                                           handler=self,
+                                           stdin=devnull,
+                                           stdout=fobj,
+                                           stderr=error_output)
         return
 
     def backup_handler(self, stream, **kwargs):
