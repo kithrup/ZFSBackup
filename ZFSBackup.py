@@ -1111,6 +1111,7 @@ class ZFSBackup(object):
             fobj = stream
             try:
                 sender = ZFSHelperCommand(command=command,
+                                          handler=self,
                                           stdin=fobj,
                                           stdout=error_output,
                                           stderr=error_output)
@@ -2608,24 +2609,27 @@ class ZFSBackupCount(ZFSBackup):
     def validate(self):
         return
     
-        
+    def counter(self, buf):
+        self._count += len(buf)
+        return buf
+    
     def backup_handler(self, stream, **kwargs):
         fobj = self._filter_backup(stream)
         if not fobj:
             raise ValueError("{}, fobj is None".format(self))
-        mByte = 1024 * 1024
-        SetNonBlock(fobj)
-        while True:
-            r, _, _ = select([fobj], [], [])
-            if not r:
-                
-                continue
-            b = fobj.read(mByte)
-            if b:
-                self._count += len(b)
-            else:
-                break
-        self._helper_done.set()
+        # Hrm, this means file descriptors leak.
+        devnull = open("/dev/null", "wb")
+        try:
+            self._count_thread = ZFSHelperThread(target=self.counter,
+                                                 handler=self,
+                                                 stdin=fobj,
+                                                 stdout=devnull,
+                                                 stderr=devnull,
+                                                 name="Counter Thread")
+            self._count_thread.start()
+        except BaseException as e:
+            print("Got an exception {}".format(str(e)), file=sys.stderr)
+            raise
         
     @property
     def target_snapshots(self):
