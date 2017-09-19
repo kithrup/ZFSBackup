@@ -2561,12 +2561,18 @@ class ZFSBackupSSH(ZFSBackup):
             try:
                 fobj = self._filter_backup(stream, error=error_output)
                 sender = ZFSHelperCommand(command=command,
+                                          handler=self,
                                           stdin=fobj,
                                           stdout=error_output,
                                           stderr=error_output)
+                sender.start()
             except (subprocess.CalledProcessError, ZFSBackupError):
                 error_output.seek(0)
-                raise ZFSBackupError(error_output.read().rstrip())
+                try:
+                    error_string = error_output.read().rstrip()
+                except:
+                    error_string = ""
+                raise ZFSBackupError(error_string)
         return
     
     @property
