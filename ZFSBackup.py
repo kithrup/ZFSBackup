@@ -394,6 +394,13 @@ class ZFSHelperThread(ZFSHelper):
         If stderr is None, we'll set it to /dev/null, and add it to
         the list for closing.
         """
+        if debug:
+            print("&&&&&&& {}._run: stdin/stdout/stderr = {}/{}/{}".format(self.name,
+                                                                           self.stdin,
+                                                                           self.stdout,
+                                                                           self.stderr),
+                  file=sys.stderr)
+        self._to_close = []
         if self.stdin is None:
             # Okay, we need to make a pipe for this.  We want to set
             # self.stdin to an fdopen of the write side, and set the
@@ -424,6 +431,12 @@ class ZFSHelperThread(ZFSHelper):
             self.stderr = open("/dev/null", "wb")
             self._to_close.append(self.stderr)
             
+        if debug:
+            print("\t{}._run: stdin/stdout/stderr = {}/{}/{}".format(self.name,
+                                                                     self.stdin,
+                                                                     self.stdout,
+                                                                     self.stderr),
+                  file=sys.stderr)
         # Inform the main thread we've started.
         self._started.set()
         mByte = 1024 * 1024
@@ -448,8 +461,9 @@ class ZFSHelperThread(ZFSHelper):
                         # a full pipe.
                         try:
                             nwritten += os.write(write_to.fileno(), buffer[nwritten:])
-                        except OSError:
-                            print("Got OSError", file=sys.stderr)
+                        except OSError as e:
+                            print("Got OSError {}".format(str(e)), file=sys.stderr)
+                            raise
                     if self._stop:
                         return
                 return
@@ -467,6 +481,7 @@ class ZFSHelperThread(ZFSHelper):
                         doWrite(temp_buf)
                     else:
                         # EOF, so let's close the output
+#                        print("*************** {}: no more input, so breaking".format(self.name), file=sys.stderr)
                         break
                 if self._stop:
                     break
@@ -474,6 +489,7 @@ class ZFSHelperThread(ZFSHelper):
         except BaseException as e:
             # Deliberately catching all exceptions
             self._exception = None if self._stop else e
+#        print("################# {}: calling HelperFinished, exception = {}".format(self.name, self._exception), file=sys.stderr)
         self.handler.HelperFinished(self, exc=self._exception)
         # Now close the files in _to_close:
         for f in self._to_close:
@@ -484,10 +500,9 @@ class ZFSHelperThread(ZFSHelper):
                     f.close()
             except OSError:
                 pass
-        self.stdin = None
-        self.stdout = None
-        self.stderr = None
-        self._to_close = []
+#        self.stdin = None
+#        self.stdout = None
+#        self.stderr = None
         self._exited.set()
         
     def stop(self):
@@ -568,8 +583,8 @@ class ZFSHelperCommand(ZFSHelper):
             self._thread = None
         if self._proc:
             self._proc.wait()
-            if self._exception:
-                raise self._exception
+        if self._exception:
+            raise self._exception
             
 class ZFSBackupFilterBase(object):
     """
@@ -668,6 +683,8 @@ class ZFSBackupFilterBase(object):
         This is to be called _after_ the filter has
         completed.
         """
+        if debug:
+            print("####### {}.finish()".format(self.name), file=sys.stderr)
         self.mode = None
         self.stdin = None
         self.stdout = None
@@ -736,6 +753,7 @@ class ZFSBackupFilterThread(ZFSBackupFilterBase, ZFSHelperThread):
         if self._thread:
             self._thread.join()
             self._thread = None
+        super(ZFSBackupFilterThread, self).finish()
         return
     
 class ZFSBackupFilterCounter(ZFSBackupFilterThread):
@@ -756,6 +774,10 @@ class ZFSBackupFilterCounter(ZFSBackupFilterThread):
         self._count += len(buffer)
         return buffer
     
+    def finish(self):
+#        print("!!!!!!!!!!!!!! {}.count = {}".format(self.name, self._count), file=sys.stderr)
+        super(ZFSBackupFilterCounter, self).finish()
+        
 class ZFSBackupFilterEncrypted(ZFSBackupFilterCommand):
     """
     A filter to encrypt and decrypt a stream.
@@ -944,6 +966,8 @@ class ZFSBackup(object):
         ZFSFilter -- at least, it needs to have the start_backup and
         start_restore methods.
         """
+        if debug:
+            print("Adding {} to list of filters".format(filter), file=sys.stderr)
         if not callable(getattr(filter, "start_backup", None)) and \
            not callable(getattr(filter, "start_restore", None)):
             raise ValueError("Incorrect type passed for filter")
@@ -1127,7 +1151,7 @@ class ZFSBackup(object):
                                           stdout=error_output,
                                           stderr=error_output)
                 sender.start()
-#                sender.wait()
+                sender.wait()
             except subprocess.CalledProcessError:
                 error_output.seek(0)
                 raise ZFSBackupError(error_output.read())
@@ -1288,7 +1312,7 @@ class ZFSBackup(object):
                     send_proc.start()
                     if debug:
                         print("backup_dict = {}".format(backup_dict), file=sys.stderr)
-                        print("send_proc.stdout = {}".format(send_proc.stdout), file=sys.stderr)
+#                    print("%%%%%%%%% send_proc.stdout = {}, command = {}".format(send_proc.stdout, command), file=sys.stderr)
                     if callable(snapshot_handler):
                         snapshot_handler(stage="start", **backup_dict)
                     try:
@@ -2555,7 +2579,10 @@ class ZFSBackupSSH(ZFSBackup):
                     pass
                 
         # If we have any transformative filters, we need to create them in reverse order.
+        if debug:
+            print("{}:  Filters {}".format(self, self.filters), file=sys.stderr)
         command = ["/sbin/zfs", "receive", "-d", "-F", self.target]
+#        command = ["/usr/bin/ktrace", "-f", "/tmp/ktrace.out", "/sbin/zfs", "receive", "-d", "-F", self.target]
         for filter in reversed(self.filters):
             if filter.transformative and filter.restore_command:
                 command = filter.restore_command + ["|"] + command
@@ -2572,6 +2599,7 @@ class ZFSBackupSSH(ZFSBackup):
                                           stdout=error_output,
                                           stderr=error_output)
                 sender.start()
+                sender.wait()
             except (subprocess.CalledProcessError, ZFSBackupError):
                 error_output.seek(0)
                 try:
