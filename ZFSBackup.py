@@ -553,7 +553,18 @@ class ZFSHelperCommand(ZFSHelper):
             self._started.set()
             self._proc.wait()
             if self._proc.returncode != 0:
-                raise subprocess.CalledProcessError(self._proc.returncode, " ".join(self.command))
+                try:
+                    self.stderr.seek(0)
+                    error_output = self.stderr.read().rstrip()
+                except:
+                    error_output = "<none>"
+                err_str = "{}: Comand `{}' returned {} ({})".format(
+                    self.name,
+                    " ".join(self.command or ["none"]),
+                    self._proc.returncode,
+                    error_output)
+                print(err_str, file=sys.stderr)
+                raise subprocess.CalledProcessError(self._proc.returncode, err_str)
             self.handler.HelperFinished(self)
         except (OSError, ValueError, subprocess.CalledProcessError) as e:
             self._started.set()
@@ -576,8 +587,13 @@ class ZFSHelperCommand(ZFSHelper):
     def stop(self):
         if self._proc:
             self._stop = True
-            self._proc.terminate()
-            
+            # If the process has already stopped, this will raise
+            # an exception, so ignore it.
+            try:
+                self._proc.terminate()
+            except OSError:
+                pass
+                
     def wait(self):
         if self._thread:
             self._thread.join()
@@ -686,7 +702,6 @@ class ZFSBackupFilterBase(object):
         """
         if debug:
             print("####### {}.finish()".format(self.name), file=sys.stderr)
-        self.mode = None
         self.stdin = None
         self.stdout = None
         self.stderr = None
@@ -1326,11 +1341,39 @@ class ZFSBackup(object):
                         raise
                     finally:
                         self._helper_done.wait()
+                    # Let's see if any of the helpers died badly
+                    raise_exception = None
+                    self._helper_lock.acquire()
+                    for helper in self._helper_status:
+                        w, e = helper
+                        if e is not None:
+                            raise_exception = e
+                            break
+                    self._helper_lock.release()
+                    if debug:
+                        print("#### exception {}".format(raise_exception), file=sys.stderr)
                     for helper in self._helpers:
-                        try:
-                            helper.finish()
-                        except AttributeError:
-                            helper.wait()
+                        if debug:
+                            print("Calling {}.finish".format(helper.name), file=sys.stderr)
+                        # If we had an exception, we want to kill all the other
+                        # helpers, and essentially be done with them
+                        if raise_exception:
+                            helper.stop()
+                            try:
+                                helper.finish()
+                            except:
+                                pass
+                            try:
+                                helper.wait()
+                            except:
+                                pass
+                        else:
+                            try:
+                                helper.finish()
+                            except AttributeError:
+                                helper.wait()
+                    if raise_exception:
+                        raise raise_exception
 #                    self._finish_filters()
 #                    send_proc.wait()
                     if callable(snapshot_handler):
@@ -2599,23 +2642,23 @@ class ZFSBackupSSH(ZFSBackup):
         command = self._build_command(*command)
         if debug:
             print("backup command = {}".format(command), file=sys.stderr)
-        with tempfile.TemporaryFile() as error_output:
+        error_output = tempfile.TemporaryFile()
+        try:
+            fobj = self._filter_backup(stream, error=error_output)
+            sender = ZFSHelperCommand(command=command,
+                                      handler=self,
+                                      stdin=fobj,
+                                      stdout=error_output,
+                                      stderr=error_output)
+            sender.start()
+            self._helpers.append(sender)
+        except (subprocess.CalledProcessError, ZFSBackupError):
+            error_output.seek(0)
             try:
-                fobj = self._filter_backup(stream, error=error_output)
-                sender = ZFSHelperCommand(command=command,
-                                          handler=self,
-                                          stdin=fobj,
-                                          stdout=error_output,
-                                          stderr=error_output)
-                sender.start()
-                self._helpers.append(sender)
-            except (subprocess.CalledProcessError, ZFSBackupError):
-                error_output.seek(0)
-                try:
-                    error_string = error_output.read().rstrip()
-                except:
-                    error_string = ""
-                raise ZFSBackupError(error_string)
+                error_string = error_output.read().rstrip()
+            except:
+                error_string = ""
+            raise ZFSBackupError(error_string)
         return
     
     @property
