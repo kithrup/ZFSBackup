@@ -489,7 +489,6 @@ class ZFSHelperThread(ZFSHelper):
         except BaseException as e:
             # Deliberately catching all exceptions
             self._exception = None if self._stop else e
-#        print("################# {}: calling HelperFinished, exception = {}".format(self.name, self._exception), file=sys.stderr)
         self.handler.HelperFinished(self, exc=self._exception)
         # Now close the files in _to_close:
         for f in self._to_close:
@@ -500,9 +499,6 @@ class ZFSHelperThread(ZFSHelper):
                     f.close()
             except OSError:
                 pass
-#        self.stdin = None
-#        self.stdout = None
-#        self.stderr = None
         self._exited.set()
         
     def stop(self):
@@ -783,7 +779,8 @@ class ZFSBackupFilterCounter(ZFSBackupFilterThread):
 
     @property
     def count(self):
-        self.wait()
+        if self._started.isSet() and not self._exited.isSet():
+            self.wait()
         return self._count
     
     def _process(self, buffer):
