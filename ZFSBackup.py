@@ -385,7 +385,7 @@ class ZFSHelperThread(ZFSHelper):
     
     def _run(self):
         """
-        The init method will have errore out if both stdin and stdout
+        The init method will error out if both stdin and stdout
         are not set.  So we can create pipes here for them.  When we
         create a pipe, we need to set both ends to non-blocking and
         close-on-exec; we also need to keep track of them so we can
@@ -567,6 +567,8 @@ class ZFSHelperCommand(ZFSHelper):
             self._exception = None if self._stop else e
             self.handler.HelperFinished(self, exc=self._exception)
         finally:
+            (self._proc.stdin or self.stdin).close()
+            (self._proc.stdout or self.stdout).close()
             self._exited.set()
             
     def start(self):
@@ -684,9 +686,9 @@ class ZFSBackupFilterBase(object):
             print("\tstdout = {}".format(self.stdout), file=sys.stderr)
         return self.stdout
 
-    def start_restore(self, source):
+    def start_restore(self, dest):
         self.mode = "restore"
-        self.stdout = source
+        self.stdout = dest
         self.start()
         return self.stdin
 
@@ -1011,6 +1013,7 @@ class ZFSBackup(object):
     def _filter_restore(self, destination, error=None, use_filters=None):
         # Private method, to stitch the restore filters together.
         # Note that they are in reverse order.
+        # destination is a file-like object that is written to.
         output = destination
         for f in reversed(use_filters if use_filters is not None else self.filters):
             f.error_output = error
@@ -1801,18 +1804,35 @@ class ZFSBackupDirectory(ZFSBackup):
         restore_filters = []
         for filter in filters:
             restore_filters.append(ZFSBackupFilterCommand(backup_command=filter,
+                                                          name="{} restore command".format(filter[0]),
                                                           handler=self,
                                                           transformative=True))
-        with tempfile.TemporaryFile() as error_output:
-            fobj = self._filter_restore(stream, error=error_output, use_filters=restore_filters)
+        error_output = tempfile.TemporaryFile()
+        devnull = open("/dev/null", "wb+")
+        
+        fobj = self._filter_restore(stream, error=error_output, use_filters=restore_filters)
+#        read_side, write_side = os.pipe()
+#        for f in [read_side, write_side]:
+#            fl = fcntl.fcntl(f, fcntl.F_GETFL)
+#            fcntl.fcntl(f, fcntl.F_SETFL, fl | fcntl.FD_CLOEXEC)
+#        read_side_obj = os.fdopen(read_side, "rb", 1024*1024)
+#        write_side_obj = os.fdopen(write_side, "wb", 1024*1024)
+        def chunk_reader_thread():
             try:
                 for chunk in chunks:
                     self._read_chunk(chunk, fobj)
-            except BaseException as e:
-                print("Got exception {} while trying to read chunk {}".format(str(e), chunk), file=sys.stderr)
             finally:
                 fobj.close()
-
+        chunk_thread = threading.Thread(target=chunk_reader_thread)
+        chunk_thread.daemon = True
+        chunk_thread.start()
+        return
+        sender = ZFSHelperThread(name="{} restore helper thread".format(self.source),
+                                 handler=self,
+                                 stdin=devnull,
+                                 stderr=error_output,
+                                 stdout=fobj)
+        sender.start()
         return
     
     def _read_chunk(self, chunk_name, stream):
@@ -1823,7 +1843,15 @@ class ZFSBackupDirectory(ZFSBackup):
             while True:
                 buf = f.read(mByte)
                 if buf:
-                    stream.write(buf)
+                    # A filter may have put its stdin
+                    # pipe (what we are writing to) into
+                    # O_NONBLOCK mode, so we need to use
+                    # select and handle partial writes.
+                    nwritten = 0
+                    while nwritten < len(buf):
+                        _, w, _ = select([], [stream], [])
+                        if w:
+                            nwritten += os.write(stream.fileno(), buf[nwritten:])
                 else:
                     break
         return
@@ -2380,7 +2408,7 @@ class ZFSBackupS3(ZFSBackupDirectory):
                 
     def _read_chunk(self, chunk_name, stream):
         # Open the chunk, read from it, and write to the stream.
-        # In the S3 case, boto takes care of al of that.
+        # In the S3 case, boto takes care of all of that.
         try:
             self.s3.download_fileobj(Fileobj=stream,
                                      Bucket=self.bucket,
