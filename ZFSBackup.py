@@ -266,7 +266,7 @@ class ZFSHelper(object):
     backup or restore process.  It works with the ZFSBackup
     object, for coordiantion, error reporting, and termination.
 
-    A ZFSHelper may be implemented using a subprocess (using Popen,
+   A ZFSHelper may be implemented using a subprocess (using Popen,
     since it is expected to be part of the pipeline), or via threads.
     
     It must implement start, stop, and wait methods.  (wait must be
@@ -964,7 +964,7 @@ class ZFSBackup(object):
     
     def HelperFinished(self, which, exc=None):
         if debug:
-            print("HelperFinished({}, exc={})".format(which, exc), file=sys.stderr)
+            print("HelperFinished({} [{}], exc={})".format(which, which.name, exc), file=sys.stderr)
         # Append the helper object / exception pair to the status list.
         self._helper_lock.acquire()
         self._helper_status.append(( which, exc))
@@ -1019,6 +1019,7 @@ class ZFSBackup(object):
             output = f.start_restore(output)
             if debug:
                 print("\tFilter output = {}".format(output), file=sys.stderr)
+            self._helpers.append(f)
         return output
     
     def __repr__(self):
@@ -1097,7 +1098,12 @@ class ZFSBackup(object):
         
         All filters are also set up here.  In the base class, that means
         no transformative filters (since there's no real point).
+
+        During a restore, restore_handler is at the beginning of the pipeline.
+        (restore_handler | filters | restore)
         """
+        if debug:
+            print("{}.restore_handler({}, {})".format(self, stream, kwargs), file=sys.stderr)
         command = ["/sbin/zfs", "send", "-p"]
         if self.recursive:
             command.append("-R")
@@ -1112,16 +1118,54 @@ class ZFSBackup(object):
         command.append("{}@{}".format(remote_ds, kwargs["Name"]))
         if debug:
             print(" ".join(command), file=sys.stderr)
-        with tempfile.TemporaryFile() as error_output:
-            # ZFS->ZFS replication doesn't use filters
-            fobj = stream
-            with open("/dev/null", "w+") as devnull:
-                reeiver = ZFSHelperCommand(command=command,
-                                           handler=self,
-                                           stdin=devnull,
-                                           stdout=fobj,
-                                           stderr=error_output)
+        error_output = tempfile.TemporaryFile()
+        # ZFS->ZFS replication doesn't use filters
+        fobj = stream
+        devnull = open("/dev/null", "wb+")
+        receiver = ZFSHelperCommand(command=command,
+                                    name="{} restore helper".format(self.source),
+                                    handler=self,
+                                    stdin=devnull,
+                                    stdout=fobj,
+                                    stderr=error_output)
+        receiver.start()
         return
+
+    def _check_helpers(self):
+        # Let's see if any of the helpers died badly
+        # Do I really only care about the first?
+        raise_exception = None
+        self._helper_lock.acquire()
+        for helper in self._helper_status:
+            w, e = helper
+            if e is not None:
+                raise_exception = e
+                break
+        self._helper_lock.release()
+        if debug:
+            print("#### exception {}".format(raise_exception), file=sys.stderr)
+        for helper in self._helpers:
+            if debug:
+                print("Calling {}.finish".format(helper.name), file=sys.stderr)
+            # If we had an exception, we want to kill all the other
+            # helpers, and essentially be done with them
+            if raise_exception:
+                helper.stop()
+                try:
+                    helper.finish()
+                except:
+                    pass
+                try:
+                    helper.wait()
+                except:
+                    pass
+            else:
+                try:
+                    helper.finish()
+                except AttributeError:
+                    helper.wait()
+            if raise_exception:
+                raise raise_exception
 
     def backup_handler(self, stream, **kwargs):
         """
@@ -1137,6 +1181,8 @@ class ZFSBackup(object):
         all subclasses must behave the same way, meaning that if the
         method doesn't run asychronously, then it still needs to
         call self._helper_done.set().
+
+        For backups, backup_handler is at the end of the pipeline.
         """
         # First we create the intervening dataset paths.  That is, the
         # equivalent of 'mkdir -p ${target}/${source}'.
@@ -1328,7 +1374,6 @@ class ZFSBackup(object):
                     self._helpers.append(send_proc)
                     if debug:
                         print("backup_dict = {}".format(backup_dict), file=sys.stderr)
-#                    print("%%%%%%%%% send_proc.stdout = {}, command = {}".format(send_proc.stdout, command), file=sys.stderr)
                     if callable(snapshot_handler):
                         snapshot_handler(stage="start", **backup_dict)
                     try:
@@ -1338,41 +1383,7 @@ class ZFSBackup(object):
                         raise
                     finally:
                         self._helper_done.wait()
-                    # Let's see if any of the helpers died badly
-                    raise_exception = None
-                    self._helper_lock.acquire()
-                    for helper in self._helper_status:
-                        w, e = helper
-                        if e is not None:
-                            raise_exception = e
-                            break
-                    self._helper_lock.release()
-                    if debug:
-                        print("#### exception {}".format(raise_exception), file=sys.stderr)
-                    for helper in self._helpers:
-                        if debug:
-                            print("Calling {}.finish".format(helper.name), file=sys.stderr)
-                        # If we had an exception, we want to kill all the other
-                        # helpers, and essentially be done with them
-                        if raise_exception:
-                            helper.stop()
-                            try:
-                                helper.finish()
-                            except:
-                                pass
-                            try:
-                                helper.wait()
-                            except:
-                                pass
-                        else:
-                            try:
-                                helper.finish()
-                            except AttributeError:
-                                helper.wait()
-                    if raise_exception:
-                        raise raise_exception
-#                    self._finish_filters()
-#                    send_proc.wait()
+                    self._check_helpers()
                     if callable(snapshot_handler):
                         snapshot_handler(stage="complete", **backup_dict)
             # Set the last_common_snapshot to make the next iteration an incremental
@@ -1484,6 +1495,10 @@ class ZFSBackup(object):
                     # as the basis of an incremental send.
                     continue
                 
+            # "-e" and "-d" affect how to parse the receive stream:
+            # -e means to use the last component, while -d means to
+            # use the full component.
+            # This should probably be an option.
             command = ["/sbin/zfs", "receive", "-e", "-F", "-v"]
             # Copy so we can add some elements to it
             restore_dict = snap.copy()
@@ -1505,6 +1520,8 @@ class ZFSBackup(object):
                 print(" ".join(command), file=sys.stderr)
 
             with tempfile.TemporaryFile(mode="a+") as error_output:
+                self._helper_done.clear()
+                self._helpers = []
                 with open("/dev/null", "w+") as devnull:
                     mByte = 1024 * 1024
                     if callable(snapshot_handler):
@@ -1513,9 +1530,12 @@ class ZFSBackup(object):
                         recv_proc = ZFSHelperCommand(command=command,
                                                      name="ZFS Restore of {}".format(self.source),
                                                      handler=self,
-                                                     stdin=devnull,
+                                                     stdout=error_output,
                                                      stderr=error_output)
                         recv_proc.start()
+                        self._helpers.append(recv_proc)
+                        # This sets things up such that recv_proc is at the end
+                        # of the pipeline.
                         self.restore_handler(recv_proc.stdin, **restore_dict)
                         recv_proc.wait()
                         if verbose:
@@ -1533,6 +1553,9 @@ class ZFSBackup(object):
                             raise ZFSBackupError("Restore failed: {}".format(error_output.read().rstrip()))
                         else:
                             raise
+                    finally:
+                        self._helper_done.wait()
+                    self._check_helpers()
                     if callable(snapshot_handler):
                         snapshot_handler(stage="complete", **restore_dict)
                     if debug:
